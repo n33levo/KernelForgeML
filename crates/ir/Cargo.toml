@@ -1,0 +1,13 @@
+[package]
+name = "kernelforge_ir"
+version = "0.1.0"
+edition = "2021"
+description = "KernelForgeML IR abstractions and MLIR integration."
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+melior = { workspace = true }
+tracing = { workspace = true }
+once_cell = { workspace = true }

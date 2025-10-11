@@ -1,0 +1,19 @@
+[package]
+name = "kernelforge_benchmarks"
+version = "0.1.0"
+edition = "2021"
+description = "Benchmark harness for KernelForgeML components."
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+kernelforge_compiler = { path = "../compiler", features = ["cli"] }
+kernelforge_ir = { path = "../ir" }
+kernelforge_kernels = { path = "../kernels" }
+kernelforge_autotune = { path = "../autotune" }
+kernelforge_backend_cpu = { path = "../backend-cpu" }
+kernelforge_backend_gpu = { path = "../backend-gpu" }

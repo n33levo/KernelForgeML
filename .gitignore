@@ -1,0 +1,52 @@
+/target
+**/target
+!Cargo.lock
+
+# Environment and configuration
+.env
+.config
+*.env
+.env.local
+.env.production
+.local
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+log/
+
+# Autotune cache (contains performance data that might include system details)
+~/.kernelforge/
+.kernelforge/
+
+# API keys and config that might be created locally
+CEREBRAS_API_KEY
+api_keys.json
+secrets.json
+config.json
+
+# Reports and generated files (benchmark results, etc.)
+reports/
+*.result
+test_results.json
+
+# Profile data
+.profile
+*.profile
+
+# KernelForge profile files
+kernelforge_profile_*.json
+
+# Generated evaluation reports
+eval_report.json

@@ -1,0 +1,57 @@
+{
+  "target": "cpu",
+  "generated_at_unix_ms": 1760125420502,
+  "cases": [
+    {
+      "case": "decoder_mha_qkv",
+      "kernel": "reference",
+      "latency_ms": 2.358125,
+      "gflops": 0.44466514709780014,
+      "bandwidth_gbps": 0.03473946461701564,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "l2_error": 0.0,
+      "problem": {
+        "m": 64,
+        "n": 64,
+        "k": 128,
+        "batch": 1,
+        "dtype": "F32"
+      }
+    },
+    {
+      "case": "decoder_mlp_up_proj",
+      "kernel": "reference",
+      "latency_ms": 18.338055,
+      "gflops": 0.514622952106971,
+      "bandwidth_gbps": 0.018762295128899986,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "l2_error": 0.0,
+      "problem": {
+        "m": 128,
+        "n": 192,
+        "k": 192,
+        "batch": 1,
+        "dtype": "F32"
+      }
+    },
+    {
+      "case": "decoder_mlp_down_proj",
+      "kernel": "reference",
+      "latency_ms": 16.733305666666666,
+      "gflops": 0.5013120639223367,
+      "bandwidth_gbps": 0.01958250249696628,
+      "max_abs_error": 0.0,
+      "mean_abs_error": 0.0,
+      "l2_error": 0.0,
+      "problem": {
+        "m": 128,
+        "n": 128,
+        "k": 256,
+        "batch": 1,
+        "dtype": "F32"
+      }
+    }
+  ]
+}

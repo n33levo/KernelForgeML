@@ -1,0 +1,24 @@
+[package]
+name = "kernelforge_compiler"
+version = "0.1.0"
+edition = "2021"
+description = "High-level compiler pipeline orchestrating IR, passes, and backends."
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true, optional = true }
+ndarray = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+tokio = { version = "1.0", features = ["rt"], optional = true }
+kernelforge_ir = { path = "../ir" }
+kernelforge_kernels = { path = "../kernels" }
+kernelforge_autotune = { path = "../autotune" }
+kernelforge_backend_cpu = { path = "../backend-cpu" }
+kernelforge_backend_gpu = { path = "../backend-gpu" }
+kernelforge_llm = { path = "../llm-inference", optional = true }
+
+[features]
+cli = ["clap", "tracing-subscriber", "kernelforge_llm", "tokio"]

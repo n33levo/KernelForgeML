@@ -1,0 +1,16 @@
+[package]
+name = "kernelforge_kernels"
+version = "0.1.0"
+edition = "2021"
+description = "Parametrized kernel implementations and traits."
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ndarray = { workspace = true }
+rayon = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
