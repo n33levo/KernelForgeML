@@ -54,9 +54,24 @@ Uses rayon for parallelism because it's built into Rust and works well.
 
 ### GPU Backend (`crates/backend-gpu`)
 
-Uses `wgpu` to dispatch compute shaders with proper timestamp query support for accurate GPU timing.
+Uses `wgpu` to dispatch compute shaders with plan-driven execution:
 
 **Why wgpu?** It's cross-platform (Metal, Vulkan, DX12) and integrates well with Rust. Could have used raw Metal APIs but wgpu gives better portability.
+
+**Plan-driven execution:**
+- `tile_m/n/k` from optimization plan → GPU workgroup sizes
+- Workgroup sizes capped at 16×16 (Metal device limits: 256 total invocations)
+- LayerNorm uses plan's vector width for workgroup configuration
+- Fusion flags control matmul+activation and MLP fusion
+
+**Hybrid transformer execution:**
+- Heavy matmuls (Q/K/V projections, scores, context) → GPU
+- Softmax → CPU (documented design choice for numeric stability)
+- LayerNorm → GPU with configurable workgroup size
+
+**Error reporting:**
+- Structured failures include: stage name, shape, error detail, applied plan knobs
+- Example: "GPU execution failed at stage 'matmul' (shape 128×256×512): workgroup size exceeded. Plan knobs: tile_m=64, tile_n=64, tile_k=32, workgroup_m=16, workgroup_n=16"
 
 The runtime includes:
 - Timestamp queries for accurate kernel timing (where supported)
@@ -71,10 +86,11 @@ The runtime includes:
 
 Thin CLI wrapper built with `clap`. Commands:
 
+- `compile-transformer` – **End-to-end workflow**: build transformer block → propose plan → validate → verify on GPU → emit results.
 - `diagnose-gpu` – print GPU adapter info and run smoke test.
 - `optimize-with-llm` – run LLM-guided optimization loop.
 - `verify-plan` – verify a specific optimization plan from JSON.
-- `mutate-and-test` – run mutation testing on the optimizer.
+- `mutate-and-test` – run mutation testing (6 validation + 3 plausible mutants).
 - `emit-mlir` – print the module's MLIR.
 - `show-passes` – list available optimization passes in the pipeline.
 - `optimize-ir` – run IR optimization and show before/after diff.
@@ -83,11 +99,27 @@ Thin CLI wrapper built with `clap`. Commands:
 
 ### Optimizer (`crates/optimizer`)
 
-The LLM-guided optimization engine:
+The LLM-guided optimization engine with assured verification:
 
 - **Optimizer trait** with `HeuristicOptimizer` (no network) and `LlmOptimizer` (OpenAI-compatible API).
-- **Verifier** compares GPU output against CPU reference with numeric tolerance.
-- **Mutator** generates broken plans to test the verifier catches real bugs.
+- **Workloads**: `Microblock` (matmul+layernorm) and `TransformerMicroblock` (Q/K/V → attention → layernorm).
+- **Verifier** runs full transformer blocks on GPU:
+  - Q/K/V projections: GPU matmul with plan tiling
+  - Scores (QK^T): GPU matmul
+  - Softmax: CPU (hybrid by design for numeric stability)
+  - Context (scores × V): GPU matmul
+  - LayerNorm: GPU with plan workgroup width
+  - Compares end-to-end output against CPU reference (tolerance: 2e-1)
+- **Structured error reporting**: GPU failures include stage, shape, error detail, and applied plan knobs.
+- **Mutation testing**:
+  - 6 validation mutants (invalid tile sizes, unknown passes, unsupported targets)
+  - 3 plausible mutants that pass validation but fail numeric equivalence:
+    - Uniform attention weights (ignores Q·K content)
+    - Missing attention scale (1/√d_k)
+    - Biased layernorm variance (no gamma/beta)
+  - Per-stage error tracking (Q/K/V/attention/final)
+  - Kill reason classification (Validation, NumericMismatch, RegressionCase)
+  - Automatic regression corpus generation
 - **BestPlansCache** persists verified optimization plans.
 
 ## Data Flow
@@ -99,14 +131,20 @@ IR builder emits MLIR
          ↓
 LLM/Heuristic proposes optimization plan
          ↓
-Verifier checks plan against CPU reference
+Plan validation (tile sizes, passes, target)
          ↓
-Backend selection (CPU or GPU)
+Verifier builds CPU reference (Q/K/V → attention → layernorm)
          ↓
-CPU: Autotuner picks kernel → Kernel executes
-GPU: wgpu shader dispatch with timing
+GPU execution (plan-driven):
+  - Q/K/V projections with plan tiling
+  - QK^T scores matmul
+  - Softmax on CPU (hybrid)
+  - Context matmul (scores × V)
+  - LayerNorm with plan workgroup
          ↓
-Results + audit report
+Numeric comparison (tolerance: 2e-1)
+         ↓
+Results + audit report + regression corpus update
 ```
 
 ## Why This Architecture?
