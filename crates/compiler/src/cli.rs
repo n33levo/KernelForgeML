@@ -484,7 +484,8 @@ pub fn run_cli(cli: Cli) -> Result<()> {
         Command::MutateAndTest { corpus } => {
             use kernelforge_optimizer::{
                 OptimizationPlan, TransformerMicroblock,
-                mutator::{Mutator, RegressionCorpus, RegressionCase, PlausibleMutantType, MutantKilledBy},
+                mutator::{Mutator, RegressionCorpus, RegressionCase, PlausibleMutantType, KillReason},
+                WorkloadSignature,
             };
             
             println!("=== KernelForgeML Mutation Testing ===\n");
@@ -505,6 +506,7 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             
             let mut killed = 0;
             let mut escaped = Vec::new();
+            let mut kill_reasons: std::collections::HashMap<KillReason, usize> = std::collections::HashMap::new();
             
             for mutant in &mutants {
                 // Check if plan validation catches the mutant
@@ -512,14 +514,8 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 
                 if caught {
                     killed += 1;
-                    println!("✓ Mutant killed ({}): {}", 
-                        match mutant.killed_by {
-                            MutantKilledBy::Validation => "validation",
-                            MutantKilledBy::NumericEquivalence => "numeric",
-                            MutantKilledBy::RegressionCase(_) => "regression",
-                        },
-                        mutant.description
-                    );
+                    *kill_reasons.entry(KillReason::Validation).or_default() += 1;
+                    println!("✓ Mutant killed (validation): {}", mutant.description);
                 } else {
                     escaped.push(mutant.description.clone());
                     println!("✗ Mutant ESCAPED: {}", mutant.description);
@@ -542,28 +538,66 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             let plausible_mutants = mutator.generate_plausible_mutants();
             println!("Generated {} plausible mutants", plausible_mutants.len());
             
-            let block = TransformerMicroblock::random(16, 32, 42);
-            let reference = block.compute_reference();
-            
+            if regression_corpus.cases.is_empty() {
+                regression_corpus = RegressionCorpus::with_defaults();
+            }
+
             let mut plausible_killed = 0;
             let tolerance = 1e-4;
             
             for pm in &plausible_mutants {
-                let mutant_output = match pm.mutant_type {
-                    PlausibleMutantType::BrokenSoftmax => block.compute_broken_softmax(),
-                    PlausibleMutantType::MissingAttentionScale => block.compute_no_scale(),
-                };
-                
-                let max_error = (&reference.final_output - &mutant_output.final_output)
-                    .mapv(|x| x.abs())
-                    .fold(0.0f32, |a, &b| a.max(b));
-                
-                if max_error > tolerance {
+                let mut killed_reason = None;
+                let mut stage_errors = None;
+
+                for case in &regression_corpus.cases {
+                    let sig = &case.signature;
+                    let block = TransformerMicroblock::random(sig.seq_len, sig.d_model, case.seed);
+                    let reference = block.compute_reference();
+                    let mutant_output = match pm.mutant_type {
+                        PlausibleMutantType::BrokenSoftmax => block.compute_broken_softmax(),
+                        PlausibleMutantType::MissingAttentionScale => block.compute_no_scale(),
+                        PlausibleMutantType::BadLayerNormVariance => block.compute_bad_layernorm(),
+                    };
+
+                    let stage_errs = stage_max_errors(&reference, &mutant_output);
+                    let max_error = stage_errs.4;
+
+                    if max_error > tolerance {
+                        let reason = if case.catches_mutant.is_some() {
+                            KillReason::RegressionCase
+                        } else {
+                            KillReason::NumericMismatch
+                        };
+                        killed_reason = Some(reason.clone());
+                        stage_errors = Some(stage_errs);
+
+                        if matches!(reason, KillReason::NumericMismatch) {
+                            let new_case = RegressionCase {
+                                signature: WorkloadSignature::transformer_block(sig.seq_len, sig.d_model),
+                                seed: case.seed.wrapping_add(1),
+                                description: format!("Auto-added for {}", pm.description),
+                                catches_mutant: Some(pm.description.clone()),
+                            };
+                            if regression_corpus.add_case(new_case) {
+                                println!("  → Added regression case for {}", pm.description);
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                if let Some(reason) = killed_reason {
                     plausible_killed += 1;
-                    println!("✓ Plausible mutant killed (numeric_equivalence): {}", pm.description);
-                    println!("  max_error: {:.2e} > tolerance {:.2e}", max_error, tolerance);
+                    *kill_reasons.entry(reason.clone()).or_default() += 1;
+                    let (q_err, k_err, v_err, attn_err, final_err) =
+                        stage_errors.unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0));
+                    println!("✓ Plausible mutant killed ({:?}): {}", reason, pm.description);
+                    println!(
+                        "  errors: q={:.2e}, k={:.2e}, v={:.2e}, attn={:.2e}, final={:.2e}",
+                        q_err, k_err, v_err, attn_err, final_err
+                    );
                 } else {
-                    println!("✗ Plausible mutant ESCAPED: {} (error {:.2e})", pm.description, max_error);
+                    println!("✗ Plausible mutant ESCAPED: {}", pm.description);
                 }
             }
             
@@ -574,6 +608,7 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             println!("Plausible mutants: {} (killed by numeric equivalence)", plausible_mutants.len());
             println!("Total killed: {}", killed);
             println!("Escaped: {}", escaped.len());
+            println!("Kill reasons: {:?}", kill_reasons);
             
             if !escaped.is_empty() {
                 println!("\nEscaped mutants:");
@@ -989,4 +1024,26 @@ fn run_gpu_transformer_block(
     )?;
 
     Ok(ln)
+}
+
+fn stage_max_errors(
+    reference: &kernelforge_optimizer::TransformerOutput,
+    mutant: &kernelforge_optimizer::TransformerOutput,
+) -> (f32, f32, f32, f32, f32) {
+    let q_err = (&reference.q - &mutant.q)
+        .mapv(|x| x.abs())
+        .fold(0.0f32, |a, &b| a.max(b));
+    let k_err = (&reference.k - &mutant.k)
+        .mapv(|x| x.abs())
+        .fold(0.0f32, |a, &b| a.max(b));
+    let v_err = (&reference.v - &mutant.v)
+        .mapv(|x| x.abs())
+        .fold(0.0f32, |a, &b| a.max(b));
+    let attn_err = (&reference.attn_output - &mutant.attn_output)
+        .mapv(|x| x.abs())
+        .fold(0.0f32, |a, &b| a.max(b));
+    let final_err = (&reference.final_output - &mutant.final_output)
+        .mapv(|x| x.abs())
+        .fold(0.0f32, |a, &b| a.max(b));
+    (q_err, k_err, v_err, attn_err, final_err)
 }

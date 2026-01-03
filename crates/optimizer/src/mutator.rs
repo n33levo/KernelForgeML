@@ -24,19 +24,19 @@ pub struct Mutant {
     pub expected_failure: String,
     /// How this mutant is expected to be killed.
     #[serde(default)]
-    pub killed_by: MutantKilledBy,
+    pub killed_by: KillReason,
 }
 
 /// How a mutant is expected to be killed.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub enum MutantKilledBy {
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum KillReason {
     /// Killed by plan validation (shape/type checks)
     #[default]
     Validation,
     /// Killed by numeric equivalence checks (CPU vs GPU mismatch)
-    NumericEquivalence,
+    NumericMismatch,
     /// Killed by a specific regression test case
-    RegressionCase(String),
+    RegressionCase,
 }
 
 /// Mutator that generates broken variants.
@@ -73,7 +73,7 @@ impl Mutator {
                 ..valid_plan.clone()
             },
             expected_failure: "Tile dimensions must be > 0".into(),
-            killed_by: MutantKilledBy::Validation,
+            killed_by: KillReason::Validation,
         });
 
         // Mutant 2: Non-power-of-2 vector width
@@ -87,7 +87,7 @@ impl Mutator {
                 ..valid_plan.clone()
             },
             expected_failure: "Vector width must be power of 2".into(),
-            killed_by: MutantKilledBy::Validation,
+            killed_by: KillReason::Validation,
         });
 
         // Mutant 3: Invalid epsilon
@@ -101,7 +101,7 @@ impl Mutator {
                 ..valid_plan.clone()
             },
             expected_failure: "LayerNorm epsilon must be > 0".into(),
-            killed_by: MutantKilledBy::Validation,
+            killed_by: KillReason::Validation,
         });
 
         // Mutant 4: Invalid pass name
@@ -114,7 +114,7 @@ impl Mutator {
                 ..valid_plan.clone()
             },
             expected_failure: "Unknown pass: nonexistent-pass".into(),
-            killed_by: MutantKilledBy::Validation,
+            killed_by: KillReason::Validation,
         });
 
         // Mutant 5: Invalid target
@@ -125,7 +125,7 @@ impl Mutator {
                 ..valid_plan.clone()
             },
             expected_failure: "Invalid target: tpu".into(),
-            killed_by: MutantKilledBy::Validation,
+            killed_by: KillReason::Validation,
         });
 
         // Mutant 6: Huge tile size
@@ -139,7 +139,7 @@ impl Mutator {
                 ..valid_plan.clone()
             },
             expected_failure: "Tile dimensions too large".into(),
-            killed_by: MutantKilledBy::Validation,
+            killed_by: KillReason::Validation,
         });
 
         mutants
@@ -158,6 +158,11 @@ impl Mutator {
                 description: "missing attention scale (1/sqrt(d_k))".into(),
                 mutant_type: PlausibleMutantType::MissingAttentionScale,
                 expected_max_error: 0.01, // Should cause drift
+            },
+            PlausibleMutant {
+                description: "biased layernorm variance (no gamma/beta)".into(),
+                mutant_type: PlausibleMutantType::BadLayerNormVariance,
+                expected_max_error: 0.01,
             },
         ]
     }
@@ -179,6 +184,8 @@ pub enum PlausibleMutantType {
     BrokenSoftmax,
     /// Missing 1/sqrt(d_k) attention scaling
     MissingAttentionScale,
+    /// Uses incorrect variance computation in layernorm
+    BadLayerNormVariance,
 }
 
 /// Regression corpus - test cases that have caught mutants.

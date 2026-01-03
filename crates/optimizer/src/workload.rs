@@ -272,6 +272,44 @@ impl TransformerMicroblock {
 
         TransformerOutput { q, k, v, attn_output, final_output }
     }
+
+    /// Compute with incorrect layer norm variance (missing mean subtraction).
+    pub fn compute_bad_layernorm(&self) -> TransformerOutput {
+        use kernelforge_kernels::matmul::{MatmulInputs, MatmulKernel, ReferenceMatmul};
+        use kernelforge_kernels::config::{ActivationKind, DataType, MatmulProblem};
+        use kernelforge_kernels::utils::normalize_rows_inplace;
+
+        let seq_len = self.signature.seq_len;
+        let d_model = self.signature.d_model;
+
+        let matmul = ReferenceMatmul::new();
+        let proj_problem = MatmulProblem::new(seq_len, d_model, d_model, DataType::F32);
+
+        let q = matmul.run(&proj_problem, &MatmulInputs::new(
+            self.input.view(), self.w_q.view(), None, ActivationKind::None
+        )).expect("Q projection failed");
+
+        let k = matmul.run(&proj_problem, &MatmulInputs::new(
+            self.input.view(), self.w_k.view(), None, ActivationKind::None
+        )).expect("K projection failed");
+
+        let v = matmul.run(&proj_problem, &MatmulInputs::new(
+            self.input.view(), self.w_v.view(), None, ActivationKind::None
+        )).expect("V projection failed");
+
+        // Correct attention
+        let scale = 1.0 / (d_model as f32).sqrt();
+        let attn_output = kernelforge_kernels::attention::scaled_dot_product_attention(
+            q.view(), k.view(), v.view(), None, scale
+        ).expect("attention failed");
+
+        // BROKEN layer norm: normalize rows without applying gamma/beta and with biased variance
+        let mut final_output = attn_output.to_owned();
+        normalize_rows_inplace(final_output.view_mut(), 1e-5);
+        final_output.mapv_inplace(|x| x * 0.95); // drift a bit to make error visible
+
+        TransformerOutput { q, k, v, attn_output, final_output }
+    }
 }
 
 /// Output from running a transformer microblock.
