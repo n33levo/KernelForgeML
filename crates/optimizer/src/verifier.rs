@@ -106,8 +106,8 @@ impl Verifier {
         // Step 3: Run GPU if target is GPU
         let (gpu_result, gpu_info) = if plan.target == "gpu" {
             if let Some(ref gpu_exec) = self.gpu_executor {
-                let sig = &microblock.signature;
-                let problem = MatmulProblem::new(sig.m, sig.n, sig.k, DataType::F32);
+                let (m, n, k) = microblock.signature.mnk();
+                let problem = MatmulProblem::new(m, n, k, DataType::F32);
                 let inputs = MatmulInputs::new(
                     microblock.input.view(),
                     microblock.weight.view(),

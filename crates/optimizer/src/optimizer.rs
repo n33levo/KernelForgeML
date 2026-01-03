@@ -42,21 +42,24 @@ pub struct WorkloadSummary {
 
 impl WorkloadSummary {
     pub fn from_signature(sig: &WorkloadSignature) -> Self {
-        let m = sig.m as u64;
-        let n = sig.n as u64;
-        let k = sig.k as u64;
+        let (m, n, k) = sig.mnk();
+        let m = m as u64;
+        let n = n as u64;
+        let k = k as u64;
         
         // 2*M*N*K for matmul
         let matmul_flops = 2 * m * n * k;
         // LayerNorm: ~5*M*N (mean, var, normalize, scale, bias)
         let ln_flops = if sig.has_layernorm { 5 * m * n } else { 0 };
+        // Attention adds ~4*seq^2*d_k flops
+        let attn_flops = if sig.has_attention { 4 * m * m * k } else { 0 };
         
         // Memory: input (M*K) + weight (K*N) + output (M*N) in f32
         let memory_bytes = ((m * k + k * n + m * n) * 4) as u64;
 
         Self {
             signature: sig.clone(),
-            total_flops: matmul_flops + ln_flops,
+            total_flops: matmul_flops + ln_flops + attn_flops,
             memory_bytes,
         }
     }
@@ -90,12 +93,13 @@ impl Optimizer for HeuristicOptimizer {
     ) -> Result<OptimizationPlan> {
         let is_gpu = hardware.backend != "cpu";
         let sig = &workload.signature;
+        let (m, n, k) = sig.mnk();
 
         // Heuristic: choose tile sizes based on problem size
-        let (tile_m, tile_n, tile_k) = if sig.m * sig.n * sig.k < 100_000 {
+        let (tile_m, tile_n, tile_k) = if m * n * k < 100_000 {
             // Small problem: smaller tiles
             (32, 32, 16)
-        } else if sig.m * sig.n * sig.k < 10_000_000 {
+        } else if m * n * k < 10_000_000 {
             // Medium problem
             (64, 64, 32)
         } else {
@@ -137,7 +141,7 @@ impl Optimizer for HeuristicOptimizer {
             target: if is_gpu { "gpu" } else { "cpu" }.into(),
             reasoning: Some(format!(
                 "Heuristic: {}x{}x{} → tiles {}x{}x{}, {}",
-                sig.m, sig.n, sig.k, tile_m, tile_n, tile_k,
+                m, n, k, tile_m, tile_n, tile_k,
                 if is_gpu { "GPU mode" } else { "CPU mode" }
             )),
         })
@@ -179,11 +183,13 @@ impl LlmOptimizer {
     }
 
     fn build_prompt(&self, workload: &WorkloadSummary, hardware: &HardwareSummary) -> String {
+        let (m, n, k) = workload.signature.mnk();
         format!(
             r#"You are a compiler optimization expert. Given a workload and hardware, propose an optimization plan.
 
 WORKLOAD:
-- Matrix dimensions: M={}, N={}, K={}
+- Sequence length: {}, Model dim: {}, Head dim: {}
+- Has Attention: {}
 - Has LayerNorm: {}
 - Total FLOPs: {}
 - Memory: {} bytes
@@ -222,9 +228,8 @@ Respond with ONLY valid JSON in this exact format (no markdown, no explanation):
   "target": "cpu",
   "reasoning": "Brief explanation"
 }}"#,
-            workload.signature.m,
-            workload.signature.n,
-            workload.signature.k,
+            m, n, k,
+            workload.signature.has_attention,
             workload.signature.has_layernorm,
             workload.total_flops,
             workload.memory_bytes,

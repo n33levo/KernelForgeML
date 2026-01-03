@@ -34,4 +34,4 @@ pub use optimizer::{HeuristicOptimizer, LlmOptimizer, Optimizer};
 pub use plan::OptimizationPlan;
 pub use report::{AuditReport, VerificationResult};
 pub use verifier::Verifier;
-pub use workload::{Microblock, WorkloadSignature};
+pub use workload::{Microblock, TransformerMicroblock, TransformerOutput, WorkloadSignature};

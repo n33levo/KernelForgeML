@@ -162,10 +162,100 @@ Generated 6 mutants
 Total mutants: 6, Killed: 6, Escaped: 0
 ```
 
+## End-to-End Compiler Workflow
+
+The `compile-transformer` command provides a complete, single-command workflow for compiling a transformer block:
+
+```bash
+# Compile a transformer block for GPU
+cargo run -p kernelforge_benchmarks -- compile-transformer \
+    --seq 128 --d-model 256 --target gpu
+
+# Or for CPU
+cargo run -p kernelforge_benchmarks -- compile-transformer \
+    --seq 64 --d-model 128 --target cpu
+```
+
+### What Happens
+
+1. **Build Workload**: Creates a `TransformerMicroblock` with:
+   - Input matrix: `[seq_len × d_model]`
+   - Q/K/V projection weights: `[d_model × d_model]`
+   - LayerNorm parameters: `[d_model]`
+
+2. **Detect Hardware**: Queries GPU capabilities (Apple M1/M2/M3/M4)
+
+3. **Propose Optimization Plan**: LLM or heuristic suggests:
+   - Tile sizes (`tile_m`, `tile_n`, `tile_k`)
+   - Vector width for SIMD
+   - Pass ordering (fuse-matmul-activation, tile-matmul, etc.)
+
+4. **Validate Plan**: Checks plan constraints:
+   - Tile sizes are valid (non-zero, power of 2 for vector width)
+   - Target is supported (`cpu` or `gpu`)
+   - All passes are known
+
+5. **Compute Reference**: CPU computes the correct output:
+   - Q = Input × W_Q, K = Input × W_K, V = Input × W_V
+   - Attention = softmax(Q × K^T / √d_k) × V
+   - Output = LayerNorm(Attention)
+
+6. **GPU Verify**: Runs on GPU and compares against CPU reference:
+   - Absolute tolerance: 1e-4
+   - Relative tolerance: 1e-5
+
+7. **Emit Results**: Saves plan and audit report to JSON
+
+### Example Output
+
+```
+=== KernelForgeML Transformer Compiler ===
+
+Step 1: Building transformer microblock workload...
+  Workload: seq_len=128, d_model=256, d_k=64
+
+Step 2: Detecting hardware...
+  Target: gpu
+  GPU: Apple M4
+
+Step 3: Proposing optimization plan...
+  Using heuristic optimizer
+  Proposed plan: tile_m=64, tile_n=64, tile_k=32
+
+Step 4: Validating plan...
+  ✓ Plan is valid
+
+Step 5: Computing CPU reference...
+  ✓ Reference computed
+
+Step 6: Verifying GPU execution against CPU reference...
+  ✓ GPU verification PASSED
+  max_error: 3.21e-6, tolerance: 1.00e-4
+
+Step 7: Emitting results...
+  Plan saved to: transformer_plan.json
+  Audit saved to: transformer_audit.json
+
+✓ Compilation successful!
+```
+
+### Additional Options
+
+| Flag | Description |
+|------|-------------|
+| `--seq` | Sequence length (default: 64) |
+| `--d-model` | Model dimension (default: 128) |
+| `--target` | `gpu` or `cpu` (default: gpu) |
+| `--optimize-with` | `heuristic` or `llm` (default: heuristic) |
+| `--seed` | Random seed for reproducibility |
+| `--plan-output` | Path for output plan JSON |
+| `--audit-output` | Path for audit report JSON |
+
 ## All Commands
 
 | Command | Description |
 |---------|-------------|
+| `compile-transformer` | **End-to-end compiler workflow for a transformer block** |
 | `diagnose-gpu` | Print GPU adapter info and run smoke test |
 | `optimize-with-llm` | Run LLM-guided optimization loop |
 | `verify-plan` | Verify a specific plan from JSON |

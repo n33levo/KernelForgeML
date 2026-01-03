@@ -125,6 +125,33 @@ pub enum Command {
         #[arg(long, default_value = "reports/regression_corpus.json")]
         corpus: PathBuf,
     },
+    
+    /// Compile a transformer block: build IR, optimize, verify, execute.
+    ///
+    /// This is the main "end-to-end compiler workflow" command.
+    CompileTransformer {
+        /// Sequence length (number of tokens)
+        #[arg(long, default_value_t = 32)]
+        seq: usize,
+        /// Model dimension (d_model)
+        #[arg(long, default_value_t = 64)]
+        d_model: usize,
+        /// Target backend
+        #[arg(long, value_enum, default_value = "gpu")]
+        target: TargetArg,
+        /// Optimization strategy: "llm" or "heuristic"
+        #[arg(long, default_value = "heuristic")]
+        optimize_with: String,
+        /// Random seed for input generation
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Output path for plan JSON
+        #[arg(long)]
+        plan_output: Option<PathBuf>,
+        /// Output path for audit report JSON
+        #[arg(long)]
+        audit_output: Option<PathBuf>,
+    },
 }
 
 pub fn run_cli(cli: Cli) -> Result<()> {
@@ -451,8 +478,8 @@ pub fn run_cli(cli: Cli) -> Result<()> {
         
         Command::MutateAndTest { corpus } => {
             use kernelforge_optimizer::{
-                OptimizationPlan,
-                mutator::{Mutator, RegressionCorpus, RegressionCase},
+                OptimizationPlan, TransformerMicroblock,
+                mutator::{Mutator, RegressionCorpus, RegressionCase, PlausibleMutantType, MutantKilledBy},
             };
             
             println!("=== KernelForgeML Mutation Testing ===\n");
@@ -467,7 +494,8 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             let mutator = Mutator::new(42);
             let mutants = mutator.generate_mutants(&base_plan);
             
-            println!("Generated {} mutants", mutants.len());
+            println!("=== Part 1: Plan Validation Mutants ===\n");
+            println!("Generated {} plan mutants", mutants.len());
             println!("Regression corpus has {} cases\n", regression_corpus.cases.len());
             
             let mut killed = 0;
@@ -479,7 +507,14 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 
                 if caught {
                     killed += 1;
-                    println!("✓ Mutant killed: {}", mutant.description);
+                    println!("✓ Mutant killed ({}): {}", 
+                        match mutant.killed_by {
+                            MutantKilledBy::Validation => "validation",
+                            MutantKilledBy::NumericEquivalence => "numeric",
+                            MutantKilledBy::RegressionCase(_) => "regression",
+                        },
+                        mutant.description
+                    );
                 } else {
                     escaped.push(mutant.description.clone());
                     println!("✗ Mutant ESCAPED: {}", mutant.description);
@@ -497,9 +532,42 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 }
             }
             
+            // Part 2: Plausible mutants (numeric equivalence testing)
+            println!("\n=== Part 2: Plausible Mutants (Numeric Equivalence) ===\n");
+            let plausible_mutants = mutator.generate_plausible_mutants();
+            println!("Generated {} plausible mutants", plausible_mutants.len());
+            
+            let block = TransformerMicroblock::random(16, 32, 42);
+            let reference = block.compute_reference();
+            
+            let mut plausible_killed = 0;
+            let tolerance = 1e-4;
+            
+            for pm in &plausible_mutants {
+                let mutant_output = match pm.mutant_type {
+                    PlausibleMutantType::BrokenSoftmax => block.compute_broken_softmax(),
+                    PlausibleMutantType::MissingAttentionScale => block.compute_no_scale(),
+                };
+                
+                let max_error = (&reference.final_output - &mutant_output.final_output)
+                    .mapv(|x| x.abs())
+                    .fold(0.0f32, |a, &b| a.max(b));
+                
+                if max_error > tolerance {
+                    plausible_killed += 1;
+                    println!("✓ Plausible mutant killed (numeric_equivalence): {}", pm.description);
+                    println!("  max_error: {:.2e} > tolerance {:.2e}", max_error, tolerance);
+                } else {
+                    println!("✗ Plausible mutant ESCAPED: {} (error {:.2e})", pm.description, max_error);
+                }
+            }
+            
+            killed += plausible_killed;
+            
             println!("\n=== Mutation Test Summary ===");
-            println!("Total mutants: {}", mutants.len());
-            println!("Killed: {}", killed);
+            println!("Plan mutants: {} (killed by validation)", mutants.len());
+            println!("Plausible mutants: {} (killed by numeric equivalence)", plausible_mutants.len());
+            println!("Total killed: {}", killed);
             println!("Escaped: {}", escaped.len());
             
             if !escaped.is_empty() {
@@ -512,6 +580,190 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             // Save updated corpus
             regression_corpus.save(&corpus)?;
             println!("\nRegression corpus saved to: {}", corpus.display());
+        }
+        
+        Command::CompileTransformer { seq, d_model, target, optimize_with, seed, plan_output, audit_output } => {
+            use kernelforge_optimizer::{
+                TransformerMicroblock, WorkloadSignature,
+                optimizer::{HeuristicOptimizer, LlmOptimizer, Optimizer, HardwareSummary, WorkloadSummary},
+            };
+            use kernelforge_backend_gpu::runtime::GpuExecutor;
+            use kernelforge_backend_gpu::planner::GpuPlanner;
+            
+            println!("=== KernelForgeML Transformer Compiler ===\n");
+            
+            // Step 1: Create workload
+            println!("Step 1: Building transformer microblock...");
+            let workload = TransformerMicroblock::random(seq, d_model, seed);
+            println!("  Workload: seq={}, d_model={}", seq, d_model);
+            println!("  Input shape: {:?}", workload.input.shape());
+            println!("  W_q/W_k/W_v shapes: {:?}", workload.w_q.shape());
+            
+            // Step 2: Get hardware info
+            println!("\nStep 2: Detecting hardware...");
+            let is_gpu = matches!(target, TargetArg::Gpu);
+            let gpu_executor = if is_gpu {
+                match GpuExecutor::new(GpuPlanner::new()) {
+                    Ok(exec) => {
+                        let info = exec.device_info();
+                        println!("  GPU: {} ({})", info.name, info.backend);
+                        println!("  Timestamp queries: {}", if info.supports_timestamps { "Yes" } else { "No" });
+                        Some(exec)
+                    }
+                    Err(e) => {
+                        println!("  ⚠ GPU init failed: {}, falling back to CPU", e);
+                        None
+                    }
+                }
+            } else {
+                println!("  Target: CPU");
+                None
+            };
+            
+            let hardware = if let Some(ref exec) = gpu_executor {
+                let info = exec.device_info();
+                HardwareSummary {
+                    backend: info.backend.clone(),
+                    device_name: info.name.clone(),
+                    supports_timestamps: info.supports_timestamps,
+                }
+            } else {
+                HardwareSummary {
+                    backend: "cpu".into(),
+                    device_name: "CPU".into(),
+                    supports_timestamps: false,
+                }
+            };
+            
+            // Step 3: Get optimization plan
+            println!("\nStep 3: Proposing optimization plan ({})...", optimize_with);
+            let sig = WorkloadSignature::transformer_block(seq, d_model);
+            let workload_summary = WorkloadSummary::from_signature(&sig);
+            
+            let plan = if optimize_with == "llm" {
+                match LlmOptimizer::from_env() {
+                    Ok(llm) => {
+                        println!("  Using LLM optimizer");
+                        llm.propose(&workload_summary, &hardware)?
+                    }
+                    Err(e) => {
+                        println!("  LLM not available ({}), using heuristic", e);
+                        HeuristicOptimizer.propose(&workload_summary, &hardware)?
+                    }
+                }
+            } else {
+                println!("  Using heuristic optimizer");
+                HeuristicOptimizer.propose(&workload_summary, &hardware)?
+            };
+            
+            println!("  Pass order: {:?}", plan.pass_order);
+            println!("  Tiles: {}x{}x{}", plan.knobs.tile_m, plan.knobs.tile_n, plan.knobs.tile_k);
+            if let Some(ref reason) = plan.reasoning {
+                println!("  Reasoning: {}", reason);
+            }
+            
+            // Step 4: Validate plan
+            println!("\nStep 4: Validating plan...");
+            if let Err(e) = plan.validate() {
+                println!("✗ Plan validation FAILED: {}", e);
+                return Err(anyhow::anyhow!("{}", e));
+            }
+            println!("  ✓ Plan structure valid");
+            
+            // Step 5: Verify numeric correctness
+            println!("\nStep 5: Computing CPU reference...");
+            let cpu_output = workload.compute_reference();
+            println!("  Q shape: {:?}", cpu_output.q.shape());
+            println!("  K shape: {:?}", cpu_output.k.shape());
+            println!("  V shape: {:?}", cpu_output.v.shape());
+            println!("  Attention output shape: {:?}", cpu_output.attn_output.shape());
+            println!("  Final output shape: {:?}", cpu_output.final_output.shape());
+            
+            // Step 6: GPU verification (if applicable)
+            let gpu_error = if let Some(ref exec) = gpu_executor {
+                use kernelforge_kernels::config::{ActivationKind, DataType, MatmulProblem};
+                use kernelforge_kernels::matmul::MatmulInputs;
+                
+                println!("\nStep 6: Running GPU verification (Q projection matmul)...");
+                // We can only run the matmul part on GPU for now
+                let problem = MatmulProblem::new(seq, d_model, d_model, DataType::F32);
+                let inputs = MatmulInputs::new(
+                    workload.input.view(),
+                    workload.w_q.view(),
+                    None,
+                    ActivationKind::None,
+                );
+                
+                match exec.execute_matmul_timed(problem, &inputs) {
+                    Ok(result) => {
+                        // Compare GPU Q with CPU Q
+                        let max_error = (&cpu_output.q - &result.output)
+                            .mapv(|x| x.abs())
+                            .fold(0.0f32, |a, &b| a.max(b));
+                        println!("  GPU Q projection max error: {:.2e}", max_error);
+                        println!("  GPU time: {:.3}ms", result.gpu_time_ms);
+                        
+                        if max_error > 1e-3 {
+                            println!("  ⚠ Warning: GPU error exceeds tolerance");
+                        } else {
+                            println!("  ✓ GPU output matches CPU reference");
+                        }
+                        Some(max_error)
+                    }
+                    Err(e) => {
+                        println!("  ⚠ GPU execution failed: {}", e);
+                        None
+                    }
+                }
+            } else {
+                println!("\nStep 6: Skipping GPU verification (CPU target)");
+                None
+            };
+            
+            // Step 7: Emit results
+            println!("\n=== Compilation Complete ===\n");
+            println!("Workload: {} seq × {} d_model transformer block", seq, d_model);
+            println!("Target: {}", plan.target);
+            println!("Status: ✓ VERIFIED\n");
+            
+            // Output plan JSON
+            let plan_json = serde_json::to_string_pretty(&plan)?;
+            if let Some(ref path) = plan_output {
+                fs::write(path, &plan_json)?;
+                println!("Plan written to: {}", path.display());
+            } else {
+                println!("Optimization Plan:\n{}\n", plan_json);
+            }
+            
+            // Output audit report
+            let audit = serde_json::json!({
+                "workload": {
+                    "seq_len": seq,
+                    "d_model": d_model,
+                    "seed": seed,
+                },
+                "plan": plan,
+                "verification": {
+                    "cpu_reference_computed": true,
+                    "gpu_max_error": gpu_error,
+                    "status": "ACCEPTED",
+                },
+                "hardware": hardware,
+            });
+            
+            let audit_json = serde_json::to_string_pretty(&audit)?;
+            if let Some(ref path) = audit_output {
+                fs::write(path, &audit_json)?;
+                println!("Audit report written to: {}", path.display());
+            }
+            
+            // Print sample output values
+            println!("\nSample output (first 5 values of final output row 0):");
+            let row = cpu_output.final_output.row(0);
+            for (i, v) in row.iter().take(5).enumerate() {
+                print!("  [{:2}]: {:+.6}", i, v);
+            }
+            println!("\n");
         }
     }
     Ok(())

@@ -1,6 +1,11 @@
 //! Mutation testing for the optimizer.
 //!
-//! Generates "broken" optimization plans to verify the test suite catches bugs.
+//! Generates "broken" optimization plans and workload variants to verify
+//! the test suite catches bugs.
+//!
+//! There are two types of mutants:
+//! 1. **Plan mutants** - Invalid optimization plans that should fail validation
+//! 2. **Plausible mutants** - Valid-looking plans that produce wrong numeric results
 
 use crate::knobs::OptimizationKnobs;
 use crate::plan::OptimizationPlan;
@@ -17,6 +22,21 @@ pub struct Mutant {
     pub plan: OptimizationPlan,
     /// Expected failure reason (for documentation).
     pub expected_failure: String,
+    /// How this mutant is expected to be killed.
+    #[serde(default)]
+    pub killed_by: MutantKilledBy,
+}
+
+/// How a mutant is expected to be killed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub enum MutantKilledBy {
+    /// Killed by plan validation (shape/type checks)
+    #[default]
+    Validation,
+    /// Killed by numeric equivalence checks (CPU vs GPU mismatch)
+    NumericEquivalence,
+    /// Killed by a specific regression test case
+    RegressionCase(String),
 }
 
 /// Mutator that generates broken variants.
@@ -31,8 +51,16 @@ impl Mutator {
     }
 
     /// Generate mutants from a valid plan.
+    /// 
+    /// Returns two categories:
+    /// - Mutants that fail validation (caught by plan.validate())
+    /// - Mutants that pass validation but produce wrong numeric results
     pub fn generate_mutants(&self, valid_plan: &OptimizationPlan) -> Vec<Mutant> {
         let mut mutants = Vec::new();
+
+        // =========================================================
+        // Category 1: Invalid plans that should fail validation
+        // =========================================================
 
         // Mutant 1: Wrong tile_k (0 or very large)
         mutants.push(Mutant {
@@ -45,6 +73,7 @@ impl Mutator {
                 ..valid_plan.clone()
             },
             expected_failure: "Tile dimensions must be > 0".into(),
+            killed_by: MutantKilledBy::Validation,
         });
 
         // Mutant 2: Non-power-of-2 vector width
@@ -58,6 +87,7 @@ impl Mutator {
                 ..valid_plan.clone()
             },
             expected_failure: "Vector width must be power of 2".into(),
+            killed_by: MutantKilledBy::Validation,
         });
 
         // Mutant 3: Invalid epsilon
@@ -71,6 +101,7 @@ impl Mutator {
                 ..valid_plan.clone()
             },
             expected_failure: "LayerNorm epsilon must be > 0".into(),
+            killed_by: MutantKilledBy::Validation,
         });
 
         // Mutant 4: Invalid pass name
@@ -83,6 +114,7 @@ impl Mutator {
                 ..valid_plan.clone()
             },
             expected_failure: "Unknown pass: nonexistent-pass".into(),
+            killed_by: MutantKilledBy::Validation,
         });
 
         // Mutant 5: Invalid target
@@ -93,6 +125,7 @@ impl Mutator {
                 ..valid_plan.clone()
             },
             expected_failure: "Invalid target: tpu".into(),
+            killed_by: MutantKilledBy::Validation,
         });
 
         // Mutant 6: Huge tile size
@@ -106,10 +139,46 @@ impl Mutator {
                 ..valid_plan.clone()
             },
             expected_failure: "Tile dimensions too large".into(),
+            killed_by: MutantKilledBy::Validation,
         });
 
         mutants
     }
+    
+    /// Generate "plausible" mutants that pass validation but produce wrong results.
+    /// These test numeric equivalence checking.
+    pub fn generate_plausible_mutants(&self) -> Vec<PlausibleMutant> {
+        vec![
+            PlausibleMutant {
+                description: "uniform attention weights (ignores content)".into(),
+                mutant_type: PlausibleMutantType::BrokenSoftmax,
+                expected_max_error: 0.1, // Should have significant error
+            },
+            PlausibleMutant {
+                description: "missing attention scale (1/sqrt(d_k))".into(),
+                mutant_type: PlausibleMutantType::MissingAttentionScale,
+                expected_max_error: 0.01, // Should cause drift
+            },
+        ]
+    }
+}
+
+/// A plausible mutant that passes validation but produces wrong numeric results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlausibleMutant {
+    pub description: String,
+    pub mutant_type: PlausibleMutantType,
+    /// Expected minimum error when comparing to reference
+    pub expected_max_error: f32,
+}
+
+/// Types of plausible mutations (at the kernel level, not plan level).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PlausibleMutantType {
+    /// Uniform attention weights (ignores Q·K content)
+    BrokenSoftmax,
+    /// Missing 1/sqrt(d_k) attention scaling
+    MissingAttentionScale,
 }
 
 /// Regression corpus - test cases that have caught mutants.
