@@ -370,9 +370,14 @@ cargo run -p kernelforge_benchmarks -- show-passes
 To use the LLM optimizer instead of the heuristic:
 
 ```bash
-export KERNELFORGE_LLM_API_KEY="sk-..."           # Required
-export KERNELFORGE_LLM_ENDPOINT="https://..."     # Optional (default: OpenAI)
-export KERNELFORGE_LLM_MODEL="gpt-4o-mini"        # Optional
+export KERNELFORGE_LLM_API_KEY="sk-..."                                                    # Your API key
+export KERNELFORGE_LLM_ENDPOINT="https://api.openai.com/v1/chat/completions"               # Optional (default: OpenAI)
+export KERNELFORGE_LLM_MODEL="gpt-4o-mini"                                                 # Optional model
+
+# Or use Groq (faster, free tier available)
+export KERNELFORGE_LLM_API_KEY="gsk-..."
+export KERNELFORGE_LLM_ENDPOINT="https://api.groq.com/openai/v1/chat/completions"
+export KERNELFORGE_LLM_MODEL="llama-3.3-70b-versatile"
 ```
 
 ## IR Optimization Passes

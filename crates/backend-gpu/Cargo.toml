@@ -2,7 +2,7 @@
 name = "kernelforge_backend_gpu"
 version = "0.1.0"
 edition = "2021"
-description = "GPU backend interface and reference implementation stubs."
+description = "GPU backend: wgpu/Metal execution with plan-driven tiling and kernel timing"
 
 [dependencies]
 anyhow = { workspace = true }
