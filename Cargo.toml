@@ -7,7 +7,7 @@ members = [
     "crates/backend-cpu",
     "crates/backend-gpu",
     "crates/benchmarks",
-    "crates/llm-inference",
+    "crates/optimizer",
 ]
 resolver = "2"
 

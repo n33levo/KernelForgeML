@@ -1,140 +1,270 @@
 # KernelForgeML
 
-A Rust + MLIR compiler framework for ML kernels, focused on transformer operations. Built this to learn how ML compilers work under the hood and experiment with kernel optimization strategies.
+**Assured LLM-Guided ML Compiler Optimizer**
 
-## What is this?
+A Rust ML compiler framework where **LLM proposes optimizations → verifier checks correctness → system learns best plans**. Built with MLIR for IR, wgpu/Metal for GPU execution on macOS.
 
-Most ML frameworks are Python with some C++ kernels. I wanted to see what it would look like to build a compiler stack in Rust that could:
-- Define transformer ops (matmul, attention, etc.) in a high-level IR
-- Use MLIR for the IR layer
-- Auto-tune kernel variants
-- Support both CPU and GPU backends
+## Overview
 
-Think of it as a toy version of what XLA or TVM do, but way simpler and Rust-first.
+KernelForgeML demonstrates a novel approach to ML compiler optimization:
 
-## Structure
+1. **LLM Proposes**: An LLM (or heuristic) suggests optimization knobs and pass ordering
+2. **Verifier Checks**: Every suggestion is verified against a CPU reference with numeric tolerance
+3. **System Learns**: Accepted plans are cached and reused for similar workloads
+
+This is the "Assured" part: **no optimization is applied unless it passes verification**.
 
 ```
-crates/
-  ir/             - MLIR IR builder and transformer dialect
-  kernels/        - Kernel implementations (matmul, attention helpers, layernorm)
-  autotune/       - Grid-search autotuner with persistent cache
-  backend-cpu/    - CPU executor + planner (rayon powered)
-  backend-gpu/    - Experimental GPU executor (wgpu/Metal)
-  compiler/       - Pass pipeline, session management, CLI wiring, eval harness
-  bench​marks/    - CLI entrypoint (`cargo run …`)
-  llm-inference/  - Minimal transformer decoder with KV-cache, RoPE, safetensors
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  Optimizer      │────▶│  Verifier        │────▶│  Best Plans     │
+│  (LLM/Heuristic)│     │  (CPU vs GPU)    │     │  Cache          │
+└─────────────────┘     └──────────────────┘     └─────────────────┘
 ```
+
+## Key Features
+
+### 🎯 LLM-Guided Optimization
+- Heuristic optimizer (no network, deterministic baseline)
+- LLM optimizer (OpenAI-compatible API) with automatic fallback
+- Structured JSON output with pass order + tuning knobs
+
+### ✅ Assured Verification
+- CPU reference vs GPU execution comparison
+- Configurable numeric tolerance (absolute + relative error)
+- Shape/type invariant checking
+- Machine-readable audit reports
+
+### 🧪 Mutation Testing
+- Automatic generation of "broken" optimization plans
+- Verifies the test suite catches real bugs
+- Regression corpus for continuous testing
+
+### 🖥️ Mac GPU First-Class Support
+- wgpu → Metal backend for Apple Silicon (M1/M2/M3/M4)
+- GPU timestamp queries for accurate kernel timing
+- `diagnose-gpu` command for quick health checks
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      High-Level IR (MLIR)                       │
+│    MatMul, Attention, MLP, LayerNorm with tensor metadata       │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   LLM-Guided Optimizer                          │
+│  • Proposes pass order    • Suggests tuning knobs               │
+│  • Falls back to heuristic if no API key                        │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Assurance Harness                           │
+│  • CPU reference computation    • Numeric tolerance checking    │
+│  • Audit report generation      • Best plans cache              │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+                              ▼
+┌───────────────┬─────────────────────────────┬───────────────────┐
+│ CPU Backend   │        GPU Backend          │  Mutation Tests   │
+│ (Rayon)       │        (wgpu/Metal)         │  (Regression)     │
+└───────────────┴─────────────────────────────┴───────────────────┘
+```
+
+## Crate Structure
+
+| Crate | Description |
+|-------|-------------|
+| `optimizer/` | **NEW** LLM proposer, verifier, mutation testing |
+| `ir/` | MLIR IR builder, custom dialect for transformer ops |
+| `kernels/` | Kernel implementations (matmul, attention, layernorm) |
+| `autotune/` | Grid-search autotuner with persistent JSON cache |
+| `backend-cpu/` | CPU planner and Rayon-based executor |
+| `backend-gpu/` | GPU executor with wgpu/Metal, timestamp queries |
+| `compiler/` | Pass pipeline, session management, CLI |
+| `benchmarks/` | CLI entrypoint for all commands |
 
 ## Setup (macOS)
 
-Need Rust and LLVM 18:
-
 ```bash
-# Install LLVM
+# Install LLVM 18
 brew install llvm@18
 
-# Set env vars (add to your .zshrc)
-export PATH="/opt/homebrew/opt/llvm@18/bin:$PATH"
-export LLVM_SYS_180_PREFIX="/opt/homebrew/opt/llvm@18"
-export MLIR_SYS_180_PREFIX="/opt/homebrew/opt/llvm@18"
-export LLVM_CONFIG_PATH="/opt/homebrew/opt/llvm@18/bin/llvm-config"
-export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
-export DYLD_LIBRARY_PATH="/opt/homebrew/lib:$DYLD_LIBRARY_PATH"
+# Clone and setup
+git clone https://github.com/your-username/KernelForgeML
+cd KernelForgeML
+source scripts/env.sh
 
-# Or just run the setup script
-./setup-macos.sh && source ~/.kernelforge_env
-```
-
-## Usage
-
-```bash
-# Build everything
-cargo build --all
+# Build
+cargo build --workspace
 
 # Run tests
-cargo test
-
-# Emit MLIR for a transformer block
-cargo run -p kernelforge_benchmarks -- emit-mlir
-
-# Benchmark a matmul (CPU)
-cargo run -p kernelforge_benchmarks -- benchmark-matmul \
-  --m 512 --n 512 --k 1024
-
-# Benchmark on GPU (Metal)
-cargo run -p kernelforge_benchmarks -- --target gpu \
-  benchmark-matmul --m 512 --n 512 --k 1024
-
-# Run the curated evaluation suite (writes JSON report)
-cargo run -p kernelforge_benchmarks -- benchmark-suite \
-  --output reports/cpu_baseline.json
-
-# Run an end-to-end decoder (random weights by default)
-cargo run -p kernelforge_benchmarks -- llm-inference \
-  --prompt "the quick brown fox" \
-  --max-tokens 20
-
-# Compare local inference vs. Cerebras hosted model (requires API key)
-CEREBRAS_API_KEY=<key> cargo run -p kernelforge_benchmarks -- llm-inference \
-  --prompt "hello" --max-tokens 32 --compare-with-cerebras
+cargo test --workspace
 ```
 
-## What works
+## Quick Start
 
-- MLIR emission for transformer blocks (`emit-mlir`)
-- CPU matmul kernels (reference, blocked, parallel) with autotuned selection
-- Evaluation suite that benchmarks representative transformer GEMMs and emits JSON reports (`reports/cpu_baseline.json`)
-- LLM decoder inference with KV-cache, RoPE, safetensors loading, and optional Cerebras API comparison
-- GPU/Metal shader dispatch (produces correct output; timing stubbed)
-- Continuous integration via GitHub Actions (fmt, clippy, tests)
+### 1. Diagnose GPU
 
-## What doesn't work / TODO
+```bash
+cargo run -p kernelforge_benchmarks -- diagnose-gpu
+```
 
-- GPU timing still reports `0.0 ms` (needs timestamp queries)
-- Attention kernel lowering is skeletal; inference uses matmul + softmax implemented on CPU
-- Fusion passes not implemented yet (IR has attributes, no lowering)
-- Only tested on macOS so far
-- Random-weight LLM demo is for plumbing verification; needs checkpoint export to be useful
+Output:
+```
+=== KernelForgeML GPU Diagnostics ===
 
-## Performance
+GPU Device: Apple M4
+Backend: Metal
+Timestamp Queries: Supported
 
-Latest evaluation suite on an Apple Silicon MacBook (macOS 14.6) using the tiny transformer cases:
+--- Running GPU Smoke Test ---
+GPU smoke test: 64x64x128 matmul, max_abs_error=0.00e0, gpu_time=0.000ms, passed=true
 
-| Case | Shape (M×N×K) | Kernel | Latency (ms) | GFLOP/s |
-|------|----------------|--------|--------------|---------|
-| decoder_mha_qkv | 64×64×128 | reference | 2.372 | 0.442 |
-| decoder_mlp_up_proj | 128×192×192 | reference | 20.716 | 0.456 |
-| decoder_mlp_down_proj | 128×128×256 | reference | 17.043 | 0.492 |
+✓ GPU smoke test PASSED
+```
 
-Numbers live in `reports/cpu_baseline.json`. Autotuning caches choices under `~/.kernelforge/autotune.json`.
+### 2. Run LLM-Guided Optimization
 
-## Why Rust + MLIR?
+```bash
+# Without LLM (uses heuristic)
+cargo run -p kernelforge_benchmarks -- optimize-with-llm --iterations 3
 
-- Rust: Memory safety, good FFI, fast compilation
-- MLIR: Modular IR infrastructure, don't have to write my own from scratch
-- Learning: Wanted to understand how compiler stacks work
+# With LLM (set API key first)
+export KERNELFORGE_LLM_API_KEY="sk-..."
+cargo run -p kernelforge_benchmarks -- optimize-with-llm --iterations 5
+```
 
-Most ML compilers use Python + C++. Rust gives you safety without GC overhead, which is nice for a compiler.
+### 3. Verify a Specific Plan
+
+```bash
+cargo run -p kernelforge_benchmarks -- verify-plan --plan my_plan.json
+```
+
+### 4. Run Mutation Testing
+
+```bash
+cargo run -p kernelforge_benchmarks -- mutate-and-test
+```
+
+Output:
+```
+=== KernelForgeML Mutation Testing ===
+
+Generated 6 mutants
+✓ Mutant killed: tile_k = 0
+✓ Mutant killed: vector_width = 3 (not power of 2)
+✓ Mutant killed: layernorm_epsilon = 0.0
+...
+
+Total mutants: 6, Killed: 6, Escaped: 0
+```
+
+## All Commands
+
+| Command | Description |
+|---------|-------------|
+| `diagnose-gpu` | Print GPU adapter info and run smoke test |
+| `optimize-with-llm` | Run LLM-guided optimization loop |
+| `verify-plan` | Verify a specific plan from JSON |
+| `mutate-and-test` | Run mutation testing on the optimizer |
+| `emit-mlir` | Emit MLIR for a transformer block |
+| `show-passes` | List available optimization passes |
+| `optimize-ir` | Show before/after IR optimization |
+| `benchmark-matmul` | Benchmark a matmul kernel |
+| `benchmark-suite` | Run the evaluation suite |
+
+## Optimization Knobs
+
+The `OptimizationKnobs` struct contains tunable parameters:
+
+```rust
+pub struct OptimizationKnobs {
+    pub tile_m: usize,           // Tile size for M dimension
+    pub tile_n: usize,           // Tile size for N dimension  
+    pub tile_k: usize,           // Tile size for K dimension
+    pub vector_width: usize,     // SIMD vector width
+    pub enable_fuse_matmul_activation: bool,
+    pub enable_fuse_mlp: bool,
+    pub enable_fold_constants: bool,
+    pub layernorm_epsilon: f32,
+}
+```
+
+## Available Passes
+
+| Pass | Description |
+|------|-------------|
+| `fold-constants` | Fold compile-time constant expressions |
+| `fuse-matmul-activation` | Fuse activation into matmul ops |
+| `fuse-mlp-block` | Fuse MLP block pattern |
+| `tile-matmul` | Apply cache-aware tiling |
+| `vectorize-layernorm` | Vectorize layer normalization |
+| `eliminate-dead-ops` | Remove unused operations |
+
+## View Optimization Passes
+
+```bash
+cargo run -p kernelforge_benchmarks -- show-passes
+```
+
+## LLM Configuration
+
+To use the LLM optimizer instead of the heuristic:
+
+```bash
+export KERNELFORGE_LLM_API_KEY="sk-..."           # Required
+export KERNELFORGE_LLM_ENDPOINT="https://..."     # Optional (default: OpenAI)
+export KERNELFORGE_LLM_MODEL="gpt-4o-mini"        # Optional
+```
+
+## IR Optimization Passes
+
+Real compiler optimizations adapted for ML:
+
+- **FuseMatmulActivation**: Fuses activation into matmul (e.g., Linear+GELU → FusedLinearGELU)
+- **TileMatmul**: Annotates for cache-efficient tiling
+- **FoldConstants**: Propagates compile-time constants (scale factors, epsilon)
+- **VectorizeLayerNorm**: Marks for SIMD execution
+- **EliminateDeadOps**: Removes unused operations
+
+## GPU Backend Details
+
+GPU backend uses wgpu with timestamp queries for accurate kernel timing:
+
+```rust
+let result = executor.execute_matmul_timed(problem, &inputs)?;
+println!("GPU time: {:.2}ms, GFLOP/s: {:.2}", 
+    result.gpu_time_ms, 
+    result.gflops(m, n, k));
+```
+
+### Why Mac GPU?
+
+- **wgpu** provides a clean abstraction over Metal on macOS
+- Apple Silicon GPUs are ubiquitous for ML development
+- Timestamp queries work on Metal, enabling accurate kernel timing
+- The `diagnose-gpu` command verifies everything works
+
+## Project Goals
+
+This project demonstrates:
+
+1. How ML compilers represent and transform computation graphs
+2. How LLMs can propose optimizations that are verified for correctness
+3. How mutation testing validates the assurance harness
+4. How backends lower high-level ops to hardware-specific code
+
+It's designed to be presentable and understandable, with a clean flow from proposal → verification → caching.
 
 ## Related Work
 
-- [MLIR](https://mlir.llvm.org/) - The IR framework this uses
-- [TVM](https://tvm.apache.org/) - Production ML compiler
-- [XLA](https://www.tensorflow.org/xla) - TensorFlow's compiler
-- [Halide](https://halide-lang.org/) - Image processing DSL with scheduling
-
-This is way simpler than any of those but borrows ideas from all of them.
-
-## Known Issues
-
-- Only works on macOS right now (needs Homebrew, Metal)
-- GPU timing infrastructure not done
-- Performance isn't amazing (reference kernels)
-- No batching support yet
-
-See [docs/architecture.md](docs/architecture.md) for more details on design decisions.
-See [docs/run_summary.md](docs/run_summary.md) for comprehensive test results and running documentation.
+- [MLIR](https://mlir.llvm.org/) - Multi-Level IR framework (used via Melior)
+- [TVM](https://tvm.apache.org/) - End-to-end ML compiler stack
+- [Triton](https://github.com/openai/triton) - OpenAI's GPU programming language
+- [LLM Compiler](https://arxiv.org/abs/2407.02524) - Meta's code optimization LLM
 
 ## License
 

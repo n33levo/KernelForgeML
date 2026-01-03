@@ -54,11 +54,14 @@ Uses rayon for parallelism because it's built into Rust and works well.
 
 ### GPU Backend (`crates/backend-gpu`)
 
-Uses `wgpu` to dispatch compute shaders. Right now it's just a placeholder that proves the shader runs. The timing infrastructure isn't hooked up yet.
+Uses `wgpu` to dispatch compute shaders with proper timestamp query support for accurate GPU timing.
 
 **Why wgpu?** It's cross-platform (Metal, Vulkan, DX12) and integrates well with Rust. Could have used raw Metal APIs but wgpu gives better portability.
 
-**TODO:** Add query pools for timing. Should be straightforward but haven't gotten to it yet.
+The runtime includes:
+- Timestamp queries for accurate kernel timing (where supported)
+- Device info reporting (backend, name, timestamp support)
+- Structured execution results with timing breakdown
 
 ### Evaluation + Compiler (`crates/compiler`)
 
@@ -68,20 +71,24 @@ Uses `wgpu` to dispatch compute shaders. Right now it's just a placeholder that 
 
 Thin CLI wrapper built with `clap`. Commands:
 
-- `emit-mlir` – print the module’s MLIR.
-- `benchmark-matmul` – run a single matmul through compile + execute, optionally dumping autotune profiles.
-- `benchmark-suite` – run the evaluation suite and write JSON (default location `reports/cpu_baseline.json`).
-- `llm-inference` – run the demo decoder, print metrics, and optionally hit the Cerebras API for side-by-side comparisons.
+- `diagnose-gpu` – print GPU adapter info and run smoke test.
+- `optimize-with-llm` – run LLM-guided optimization loop.
+- `verify-plan` – verify a specific optimization plan from JSON.
+- `mutate-and-test` – run mutation testing on the optimizer.
+- `emit-mlir` – print the module's MLIR.
+- `show-passes` – list available optimization passes in the pipeline.
+- `optimize-ir` – run IR optimization and show before/after diff.
+- `benchmark-matmul` – run a single matmul through compile + execute.
+- `benchmark-suite` – run the evaluation suite and write JSON.
 
-### LLM Inference (`crates/llm-inference`)
+### Optimizer (`crates/optimizer`)
 
-Provides a minimal decoder-only transformer to prove the kernels work in a realistic loop. Includes:
+The LLM-guided optimization engine:
 
-- Rotary Position Embeddings (RoPE).
-- KV-cache with prefill/decode separation and memory accounting.
-- Decoder blocks built atop the kernel library.
-- Safetensors loader and random-weight fallback for quick experiments.
-- Optional Cerebras API client for hosted model comparisons.
+- **Optimizer trait** with `HeuristicOptimizer` (no network) and `LlmOptimizer` (OpenAI-compatible API).
+- **Verifier** compares GPU output against CPU reference with numeric tolerance.
+- **Mutator** generates broken plans to test the verifier catches real bugs.
+- **BestPlansCache** persists verified optimization plans.
 
 ## Data Flow
 
@@ -90,14 +97,16 @@ User defines transformer block
          ↓
 IR builder emits MLIR
          ↓
-Compiler pipeline (no-op right now, could add passes here)
+LLM/Heuristic proposes optimization plan
+         ↓
+Verifier checks plan against CPU reference
          ↓
 Backend selection (CPU or GPU)
          ↓
 CPU: Autotuner picks kernel → Kernel executes
-GPU: wgpu shader dispatch
+GPU: wgpu shader dispatch with timing
          ↓
-Results + profiling data
+Results + audit report
 ```
 
 ## Why This Architecture?

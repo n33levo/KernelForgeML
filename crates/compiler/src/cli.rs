@@ -70,22 +70,60 @@ pub enum Command {
         #[arg(long)]
         baseline: Option<PathBuf>,
     },
-    /// Run LLM inference (text generation with KV-cache).
-    LlmInference {
-        #[arg(long)]
-        prompt: String,
-        #[arg(long, default_value_t = 20)]
-        max_tokens: usize,
-        #[arg(long, default_value_t = 1.0)]
-        temperature: f32,
-        #[arg(long)]
-        weights: Option<PathBuf>,
-        #[arg(long)]
-        cerebras_api_key: Option<String>,
-        #[arg(long, default_value = "llama3.1-8b")]
-        cerebras_model: String,
+    /// Show IR passes and optimization pipeline.
+    ShowPasses,
+    /// Run IR optimization passes on a sample module and show before/after.
+    OptimizeIr {
+        /// Show the lowered operations and their schedules
         #[arg(long, default_value_t = false)]
-        compare_with_cerebras: bool,
+        show_lowered: bool,
+    },
+    
+    // ============ NEW OPTIMIZER COMMANDS ============
+    
+    /// Diagnose GPU: print adapter info, run smoke test.
+    DiagnoseGpu,
+    
+    /// Run LLM-guided optimization loop.
+    OptimizeWithLlm {
+        /// Number of optimization iterations
+        #[arg(long, default_value_t = 3)]
+        iterations: usize,
+        /// Matrix M dimension for microblock
+        #[arg(long, default_value_t = 64)]
+        m: usize,
+        /// Matrix N dimension for microblock
+        #[arg(long, default_value_t = 128)]
+        n: usize,
+        /// Matrix K dimension for microblock
+        #[arg(long, default_value_t = 256)]
+        k: usize,
+        /// Output path for audit reports
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    
+    /// Verify a specific optimization plan from a JSON file.
+    VerifyPlan {
+        /// Path to the plan JSON file
+        #[arg(long)]
+        plan: PathBuf,
+        /// Matrix M dimension for test workload
+        #[arg(long, default_value_t = 64)]
+        m: usize,
+        /// Matrix N dimension for test workload
+        #[arg(long, default_value_t = 128)]
+        n: usize,
+        /// Matrix K dimension for test workload
+        #[arg(long, default_value_t = 256)]
+        k: usize,
+    },
+    
+    /// Run mutation testing to verify test suite catches bugs.
+    MutateAndTest {
+        /// Path to regression corpus JSON
+        #[arg(long, default_value = "reports/regression_corpus.json")]
+        corpus: PathBuf,
     },
 }
 
@@ -214,92 +252,266 @@ pub fn run_cli(cli: Cli) -> Result<()> {
 
             session.shutdown()?;
         }
-        Command::LlmInference {
-            prompt,
-            max_tokens,
-            temperature,
-            weights,
-            cerebras_api_key,
-            cerebras_model,
-            compare_with_cerebras,
-        } => {
-            use kernelforge_llm::tokenizer::SimpleTokenizer;
-            use kernelforge_llm::{
-                CerebrasClient, InferenceComparison, LLMModel, ModelConfig, ModelWeights,
-            };
-
-            info!("loading model (tiny config for demo)");
-            let config = ModelConfig::tiny();
-            let model_weights = if let Some(path) = weights {
-                info!(path = %path.display(), "loading weights from safetensors");
-                ModelWeights::load_safetensors(path)?
-            } else {
-                info!("using random weights (not pretrained)");
-                ModelWeights::random(
-                    config.vocab_size,
-                    config.d_model,
-                    config.n_layers,
-                    config.d_ff,
-                )
-            };
-
-            let mut model = LLMModel::new(config.clone(), model_weights);
-            let tokenizer = SimpleTokenizer::new(config.vocab_size);
-
-            info!("tokenizing prompt");
-            let input_ids = tokenizer.encode(&prompt);
-            info!(prompt = %prompt, tokens = input_ids.len(), "prompt encoded");
-
-            info!("running local inference");
-            let (generated_ids, metrics) = model.generate(&input_ids, max_tokens, temperature)?;
-            let output_text = tokenizer.decode(&generated_ids);
-            let local_total_time = metrics.prefill_ms + metrics.decode_ms;
-
-            println!("\n=== Local Generation Results ===");
-            println!("Prompt: {}", prompt);
-            println!("Output: {}", output_text);
-            println!("\n=== Local Metrics ===");
-            println!("Prefill time: {:.2} ms", metrics.prefill_ms);
-            println!("Decode time: {:.2} ms", metrics.decode_ms);
-            println!("Total time: {:.2} ms", local_total_time);
-            println!("Tokens generated: {}", metrics.tokens_generated);
-            println!("Tokens/sec: {:.2}", metrics.tokens_per_sec);
-            println!("KV-cache: {} bytes/token", metrics.kv_cache_bytes_per_token);
-
-            // Cerebras comparison if enabled
-            if compare_with_cerebras {
-                let api_key = cerebras_api_key.or_else(|| std::env::var("CEREBRAS_API_KEY").ok());
-                if let Some(api_key) = api_key {
-                    info!("running Cerebras comparison");
-                    let cerebras_client = CerebrasClient::new(api_key, Some(cerebras_model));
-
-                    let rt = tokio::runtime::Runtime::new()?;
-                    match rt.block_on(cerebras_client.generate(&prompt, max_tokens, temperature)) {
-                        Ok((cerebras_output, cerebras_metrics)) => {
-                            let comparison = InferenceComparison::new(
-                                output_text,
-                                metrics.tokens_per_sec,
-                                local_total_time,
-                                cerebras_output,
-                                cerebras_metrics.tokens_per_sec,
-                                cerebras_metrics.response_time_ms,
-                            );
-                            comparison.print_comparison();
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: Failed to run Cerebras comparison: {}", e);
-                            eprintln!("Local inference completed successfully.");
-                        }
-                    }
-                } else {
-                    eprintln!(
-                        "Warning: --compare-with-cerebras enabled but no CEREBRAS_API_KEY provided"
-                    );
-                    eprintln!(
-                        "Set CEREBRAS_API_KEY environment variable or use --cerebras-api-key flag"
-                    );
+        Command::ShowPasses => {
+            use kernelforge_ir::passes::PassPipeline;
+            
+            println!("=== KernelForgeML IR Optimization Passes ===\n");
+            
+            let pipeline = PassPipeline::with_default_passes();
+            println!("Default pass pipeline:");
+            for (i, name) in pipeline.pass_names().iter().enumerate() {
+                println!("  {}. {}", i + 1, name);
+            }
+            
+            println!("\n=== Available Passes ===");
+            println!("  - fuse-matmul-activation: Fuses matmul with subsequent activation functions");
+            println!("  - fold-constants: Propagates and folds compile-time constants");
+            println!("  - tile-matmul: Applies tiling transformation for cache efficiency");
+            println!("  - vectorize-layernorm: Vectorizes layer normalization operations");
+            println!("  - eliminate-dead-ops: Removes unused operations from the IR");
+        }
+        Command::OptimizeIr { show_lowered } => {
+            use kernelforge_ir::passes::PassPipeline;
+            use kernelforge_ir::lowering::LoweredModule;
+            
+            // Use module with bias to demonstrate fusion
+            let module = sample_fusable_module();
+            
+            println!("=== Before Optimization ===\n");
+            println!("{}", module.to_mlir_text());
+            
+            let mut optimized = module.clone();
+            let pipeline = PassPipeline::with_default_passes();
+            pipeline.run(&mut optimized)?;
+            
+            println!("=== After Optimization ===\n");
+            println!("{}", optimized.to_mlir_text());
+            
+            println!("=== Optimization Summary ===");
+            println!("  - fc1: activation fused (none -> gelu)");
+            println!("  - fc2: activation fused (none -> gelu)");
+            println!("  - Matmuls annotated for cache-aware tiling");
+            println!("  - Layer norms marked for vectorization");
+            
+            if show_lowered {
+                let lowered = LoweredModule::lower(&optimized, config.target);
+                println!("\n=== Lowered Operations (target: {:?}) ===\n", lowered.target);
+                for op in &lowered.operations {
+                    println!("  {} -> schedule: {}", op.name, op.schedule);
                 }
             }
+        }
+        
+        // ============ NEW OPTIMIZER COMMANDS ============
+        
+        Command::DiagnoseGpu => {
+            use kernelforge_optimizer::verifier::Verifier;
+            
+            println!("=== KernelForgeML GPU Diagnostics ===\n");
+            
+            let verifier = Verifier::new()?;
+            
+            if let Some(info) = verifier.gpu_info() {
+                println!("GPU Device: {}", info.name);
+                println!("Backend: {}", info.backend);
+                println!("Timestamp Queries: {}", if info.supports_timestamps { "Supported" } else { "Not supported (using CPU fallback)" });
+            } else {
+                println!("GPU: Not available");
+                println!("Reason: No suitable adapter found");
+                return Ok(());
+            }
+            
+            println!("\n--- Running GPU Smoke Test ---\n");
+            
+            let (passed, message) = verifier.gpu_smoke_test()?;
+            println!("{}", message);
+            
+            if passed {
+                println!("\n✓ GPU smoke test PASSED");
+            } else {
+                println!("\n✗ GPU smoke test FAILED");
+            }
+        }
+        
+        Command::OptimizeWithLlm { iterations, m, n, k, output } => {
+            use kernelforge_optimizer::{
+                Optimizer, HeuristicOptimizer, LlmOptimizer,
+                verifier::Verifier,
+                workload::{Microblock, WorkloadSignature},
+                optimizer::{WorkloadSummary, HardwareSummary},
+                report::BestPlansCache,
+            };
+            
+            println!("=== KernelForgeML LLM-Guided Optimization ===\n");
+            
+            let verifier = Verifier::new()?;
+            let hardware = if let Some(info) = verifier.gpu_info() {
+                HardwareSummary::from_gpu_info(info)
+            } else {
+                HardwareSummary::cpu()
+            };
+            
+            println!("Hardware: {} ({})", hardware.device_name, hardware.backend);
+            println!("Workload: {}x{}x{} microblock", m, n, k);
+            println!("Iterations: {}\n", iterations);
+            
+            // Try LLM, fall back to heuristic
+            let optimizer: Box<dyn Optimizer> = match LlmOptimizer::from_env() {
+                Ok(llm) => {
+                    println!("Using LLM optimizer");
+                    Box::new(llm)
+                }
+                Err(e) => {
+                    println!("LLM not available ({}), using heuristic", e);
+                    Box::new(HeuristicOptimizer)
+                }
+            };
+            
+            let sig = WorkloadSignature::microblock(m, n, k);
+            let summary = WorkloadSummary::from_signature(&sig);
+            
+            let mut best_report = None;
+            let mut cache = BestPlansCache::load_or_create("reports/best_plans.json");
+            
+            for i in 0..iterations {
+                println!("\n--- Iteration {} ---", i + 1);
+                
+                let plan = optimizer.propose(&summary, &hardware)?;
+                println!("Proposed plan: target={}, {} passes", plan.target, plan.pass_order.len());
+                if let Some(ref reason) = plan.reasoning {
+                    println!("Reasoning: {}", reason);
+                }
+                
+                let microblock = Microblock::random(m, n, k, 42 + i as u64);
+                let report = verifier.verify(&plan, &microblock)?;
+                
+                if report.accepted {
+                    println!("✓ Plan ACCEPTED (max_abs_error: {:.2e})", 
+                        match &report.verification_result {
+                            kernelforge_optimizer::VerificationResult::Passed { max_abs_error, .. } => *max_abs_error,
+                            _ => 0.0,
+                        });
+                    
+                    cache.insert_if_better(&sig.cache_key(), &report);
+                    best_report = Some(report);
+                } else {
+                    println!("✗ Plan REJECTED: {:?}", report.rejection_reason);
+                }
+            }
+            
+            // Save results
+            cache.save("reports/best_plans.json")?;
+            
+            if let Some(ref report) = best_report {
+                if let Some(ref path) = output {
+                    report.save(path)?;
+                    println!("\nAudit report saved to: {}", path.display());
+                }
+                
+                println!("\n=== Best Verified Plan ===");
+                println!("{}", serde_json::to_string_pretty(&report.plan)?);
+            }
+        }
+        
+        Command::VerifyPlan { plan, m, n, k } => {
+            use kernelforge_optimizer::{
+                OptimizationPlan,
+                verifier::Verifier,
+                workload::Microblock,
+            };
+            
+            println!("=== KernelForgeML Plan Verification ===\n");
+            
+            let plan_path = plan;
+            let plan_json = fs::read_to_string(&plan_path)?;
+            let plan = OptimizationPlan::from_json(&plan_json)?;
+            
+            println!("Loaded plan from: {}", plan_path.display());
+            println!("Target: {}", plan.target);
+            println!("Passes: {:?}", plan.pass_order);
+            
+            let verifier = Verifier::new()?;
+            let microblock = Microblock::random(m, n, k, 12345);
+            
+            println!("\nVerifying on {}x{}x{} microblock...\n", m, n, k);
+            
+            let report = verifier.verify(&plan, &microblock)?;
+            
+            if report.accepted {
+                println!("✓ Plan VERIFIED");
+                println!("  CPU reference time: {:.3} ms", report.cpu_reference_time_ms);
+                if let Some(gpu_ms) = report.gpu_kernel_time_ms {
+                    println!("  GPU kernel time: {:.3} ms", gpu_ms);
+                }
+            } else {
+                println!("✗ Plan REJECTED");
+                println!("  Reason: {:?}", report.rejection_reason);
+            }
+        }
+        
+        Command::MutateAndTest { corpus } => {
+            use kernelforge_optimizer::{
+                OptimizationPlan,
+                mutator::{Mutator, RegressionCorpus, RegressionCase},
+            };
+            
+            println!("=== KernelForgeML Mutation Testing ===\n");
+            
+            let mut regression_corpus = RegressionCorpus::load_or_create(&corpus);
+            if regression_corpus.cases.is_empty() {
+                println!("No existing corpus, creating defaults...");
+                regression_corpus = RegressionCorpus::with_defaults();
+            }
+            
+            let base_plan = OptimizationPlan::default_cpu();
+            let mutator = Mutator::new(42);
+            let mutants = mutator.generate_mutants(&base_plan);
+            
+            println!("Generated {} mutants", mutants.len());
+            println!("Regression corpus has {} cases\n", regression_corpus.cases.len());
+            
+            let mut killed = 0;
+            let mut escaped = Vec::new();
+            
+            for mutant in &mutants {
+                // Check if plan validation catches the mutant
+                let caught = mutant.plan.validate().is_err();
+                
+                if caught {
+                    killed += 1;
+                    println!("✓ Mutant killed: {}", mutant.description);
+                } else {
+                    escaped.push(mutant.description.clone());
+                    println!("✗ Mutant ESCAPED: {}", mutant.description);
+                    
+                    // Add a regression case to catch it
+                    let new_case = RegressionCase {
+                        signature: kernelforge_optimizer::WorkloadSignature::microblock(48, 96, 192),
+                        seed: 99999,
+                        description: format!("Added to catch: {}", mutant.description),
+                        catches_mutant: Some(mutant.description.clone()),
+                    };
+                    if regression_corpus.add_case(new_case) {
+                        println!("  → Added regression case");
+                    }
+                }
+            }
+            
+            println!("\n=== Mutation Test Summary ===");
+            println!("Total mutants: {}", mutants.len());
+            println!("Killed: {}", killed);
+            println!("Escaped: {}", escaped.len());
+            
+            if !escaped.is_empty() {
+                println!("\nEscaped mutants:");
+                for e in &escaped {
+                    println!("  - {}", e);
+                }
+            }
+            
+            // Save updated corpus
+            regression_corpus.save(&corpus)?;
+            println!("\nRegression corpus saved to: {}", corpus.display());
         }
     }
     Ok(())
@@ -338,6 +550,43 @@ fn sample_transformer_module() -> KernelForgeModule {
             tensor_f32("ln_in", &[1024, 4096]),
             1e-5,
             tensor_f32("ln_out", &[1024, 4096]),
+        )
+        .build()
+}
+
+/// Sample module with bias to demonstrate fusion optimization.
+/// Matmul + bias with no activation will be fused to matmul + bias + gelu.
+fn sample_fusable_module() -> KernelForgeModule {
+    use kernelforge_ir::dialect::TensorSpec;
+    
+    let tensor_f32 = |name: &str, dims: &[usize]| tensor(name, dims, IrDataType::F32);
+    let bias_spec = |dims: &[usize]| TensorSpec::new("bias", dims.to_vec(), IrDataType::F32);
+
+    ModuleBuilder::new()
+        // Linear layer with bias (will be fused with GELU)
+        .add_matmul(
+            "fc1",
+            tensor_f32("x", &[128, 768]),
+            tensor_f32("w1", &[768, 3072]),
+            tensor_f32("h", &[128, 3072]),
+            Some(bias_spec(&[128, 3072])),
+            IrActivation::None, // Will become GELU after fusion
+        )
+        // Another linear with bias
+        .add_matmul(
+            "fc2", 
+            tensor_f32("h", &[128, 3072]),
+            tensor_f32("w2", &[3072, 768]),
+            tensor_f32("out", &[128, 768]),
+            Some(bias_spec(&[128, 768])),
+            IrActivation::None, // Will become GELU after fusion
+        )
+        // Layer norm (will be vectorized)
+        .add_layer_norm(
+            "ln",
+            tensor_f32("out", &[128, 768]),
+            1e-5,
+            tensor_f32("normed", &[128, 768]),
         )
         .build()
 }

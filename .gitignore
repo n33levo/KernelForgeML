@@ -4,6 +4,7 @@
 
 # Environment and configuration
 .env
+.envrc
 .config
 *.env
 .env.local
@@ -31,7 +32,6 @@ log/
 .kernelforge/
 
 # API keys and config that might be created locally
-CEREBRAS_API_KEY
 api_keys.json
 secrets.json
 config.json
@@ -50,3 +50,6 @@ kernelforge_profile_*.json
 
 # Generated evaluation reports
 eval_report.json
+
+# direnv cache
+.direnv/

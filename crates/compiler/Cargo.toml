@@ -12,13 +12,12 @@ tracing = { workspace = true }
 clap = { workspace = true, optional = true }
 ndarray = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
-tokio = { version = "1.0", features = ["rt"], optional = true }
 kernelforge_ir = { path = "../ir" }
 kernelforge_kernels = { path = "../kernels" }
 kernelforge_autotune = { path = "../autotune" }
 kernelforge_backend_cpu = { path = "../backend-cpu" }
 kernelforge_backend_gpu = { path = "../backend-gpu" }
-kernelforge_llm = { path = "../llm-inference", optional = true }
+kernelforge_optimizer = { path = "../optimizer", optional = true }
 
 [features]
-cli = ["clap", "tracing-subscriber", "kernelforge_llm", "tokio"]
+cli = ["clap", "tracing-subscriber", "kernelforge_optimizer"]

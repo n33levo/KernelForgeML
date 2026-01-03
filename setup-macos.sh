@@ -34,6 +34,15 @@ else
     echo "✅ LLVM 18 already installed"
 fi
 
+# Install zstd (required for LLVM linking)
+if ! brew list zstd &> /dev/null; then
+    echo "📦 Installing zstd..."
+    brew install zstd
+    echo "✅ zstd installed"
+else
+    echo "✅ zstd already installed"
+fi
+
 # Set environment variables
 echo ""
 echo "=== Setting Environment Variables ==="
@@ -61,6 +70,15 @@ echo ""
 # Load environment for this session
 source "$ENV_FILE"
 
+# Verify LLVM
+echo "=== Verifying LLVM ==="
+if command -v llvm-config &> /dev/null; then
+    echo "✅ LLVM version: $(llvm-config --version)"
+else
+    echo "❌ llvm-config not found in PATH"
+    exit 1
+fi
+
 # Create autotune cache directory
 mkdir -p "$HOME/.kernelforge"
 echo "✅ Created cache directory: $HOME/.kernelforge"
@@ -71,21 +89,31 @@ echo "=== Building KernelForgeML ==="
 cargo build --all
 
 echo ""
-echo "✅ Build complete!"
+echo "=== Running Tests ==="
+cargo test --workspace
+
+echo ""
+echo "✅ Build and tests complete!"
 echo ""
 echo "=== Quick Start ==="
 echo ""
-echo "Run these commands to test the system:"
+echo "Available commands:"
 echo ""
-echo "1. Emit MLIR:"
+echo "1. Diagnose GPU:"
+echo "   cargo run -p kernelforge_benchmarks -- diagnose-gpu"
+echo ""
+echo "2. Run LLM-guided optimization:"
+echo "   cargo run -p kernelforge_benchmarks -- optimize-with-llm --iterations 3"
+echo ""
+echo "3. Run mutation testing:"
+echo "   cargo run -p kernelforge_benchmarks -- mutate-and-test"
+echo ""
+echo "4. Emit MLIR for transformer ops:"
 echo "   cargo run -p kernelforge_benchmarks -- emit-mlir"
 echo ""
-echo "2. CPU benchmark:"
+echo "5. CPU benchmark:"
 echo "   cargo run -p kernelforge_benchmarks -- benchmark-matmul --m 512 --n 512 --k 1024"
 echo ""
-echo "3. GPU benchmark (Metal):"
-echo "   cargo run -p kernelforge_benchmarks -- --target gpu benchmark-matmul --m 512 --n 512 --k 1024"
-echo ""
-echo "4. Full benchmark suite:"
-echo "   cargo run -p kernelforge_benchmarks -- benchmark-suite --output results.json"
+echo "6. GPU benchmark (Metal):"
+echo "   cargo run -p kernelforge_benchmarks -- --target gpu benchmark-matmul --m 256 --n 256 --k 512"
 echo ""
