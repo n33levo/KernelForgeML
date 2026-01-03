@@ -92,6 +92,16 @@ impl OptimizationPlan {
 
         Ok(())
     }
+
+    /// Normalize common target aliases to accepted values.
+    pub fn normalize_target(&mut self) {
+        let lower = self.target.to_ascii_lowercase();
+        self.target = match lower.as_str() {
+            "cpu" => "cpu".into(),
+            "gpu" | "metal" | "mps" => "gpu".into(),
+            _ => self.target.clone(),
+        };
+    }
 }
 
 impl Default for OptimizationPlan {
@@ -110,6 +120,15 @@ mod tests {
         let json = plan.to_json().unwrap();
         let parsed = OptimizationPlan::from_json(&json).unwrap();
         assert_eq!(plan.pass_order, parsed.pass_order);
+    }
+
+    #[test]
+    fn test_normalize_target_aliases() {
+        let mut plan = OptimizationPlan::default_gpu();
+        plan.target = "metal".into();
+        plan.normalize_target();
+        assert_eq!(plan.target, "gpu");
+        assert!(plan.validate().is_ok());
     }
 
     #[test]

@@ -24,9 +24,12 @@ This is the "Assured" part: **no optimization is applied unless it passes verifi
 ## Key Features
 
 ### 🎯 LLM-Guided Optimization
+- **Production-ready**: Supports OpenAI, Groq, Together AI, and any OpenAI-compatible API
 - Heuristic optimizer (no network, deterministic baseline)
-- LLM optimizer (OpenAI-compatible API) with automatic fallback
+- LLM optimizer with automatic fallback if API unavailable
+- Target normalization handles common aliases (metal→gpu, mps→gpu)
 - Structured JSON output with pass order + tuning knobs
+- All LLM proposals are verified before acceptance
 
 ### ✅ Assured Verification
 - Full transformer block GPU execution:
@@ -139,14 +142,43 @@ GPU smoke test: 64x64x128 matmul, max_abs_error=0.00e0, gpu_time=0.000ms, passed
 
 ### 2. Run LLM-Guided Optimization
 
+The optimizer supports **OpenAI-compatible APIs** (OpenAI, Groq, Together AI, local vLLM, etc.) with automatic fallback to heuristic if unavailable.
+
 ```bash
-# Without LLM (uses heuristic)
+# Without LLM (uses heuristic fallback)
 cargo run -p kernelforge_benchmarks -- optimize-with-llm --iterations 3
 
-# With LLM (set API key first)
+# With OpenAI
 export KERNELFORGE_LLM_API_KEY="sk-..."
-cargo run -p kernelforge_benchmarks -- optimize-with-llm --iterations 5
+export KERNELFORGE_LLM_MODEL="gpt-4o-mini"  # optional, default
+cargo run -p kernelforge_benchmarks -- optimize-with-llm --iterations 3
+
+# With Groq (fast Llama models)
+export KERNELFORGE_LLM_API_KEY="gsk-..."
+export KERNELFORGE_LLM_ENDPOINT="https://api.groq.com/openai/v1/chat/completions"
+export KERNELFORGE_LLM_MODEL="llama-3.3-70b-versatile"
+cargo run -p kernelforge_benchmarks -- optimize-with-llm --iterations 3
 ```
+
+**Example LLM Output** (Llama 3.3 70B on 128×128×128):
+```
+--- Iteration 1 ---
+Proposed plan: target=gpu, 4 passes
+Reasoning: Optimizing for Apple M4 GPU with Metal backend, focusing on vectorization and tiling
+✓ Plan ACCEPTED (max_abs_error: 0.00e0)
+
+=== Best Verified Plan ===
+{
+  "pass_order": ["fold-constants", "eliminate-dead-ops", "vectorize-layernorm", "tile-matmul"],
+  "knobs": { "tile_m": 64, "tile_n": 64, "tile_k": 32, "vector_width": 8, ... },
+  "target": "gpu"
+}
+```
+
+**Resilience Features:**
+- Target normalization: LLM outputs like `"metal"` or `"mps"` are auto-mapped to `"gpu"`
+- Invalid plans (bad tile sizes, unknown passes) trigger automatic heuristic fallback
+- All proposed plans are verified against CPU reference before acceptance
 
 ### 3. Verify a Specific Plan
 

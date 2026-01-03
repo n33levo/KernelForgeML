@@ -211,6 +211,7 @@ CONSTRAINTS:
 - GPU backend does NOT support fused activation or bias yet
 - tile_m, tile_n, tile_k must be powers of 2 between 16 and 128
 - vector_width must be 4 or 8
+- target must be exactly "cpu" or "gpu" (do NOT return "metal", "mps", or other variants)
 
 Respond with ONLY valid JSON in this exact format (no markdown, no explanation):
 {{
@@ -282,7 +283,8 @@ impl Optimizer for LlmOptimizer {
 
                 // Try to parse the JSON response
                 match OptimizationPlan::from_json(content) {
-                    Ok(plan) => {
+                    Ok(mut plan) => {
+                        plan.normalize_target();
                         // Validate the plan
                         if let Err(e) = plan.validate() {
                             tracing::warn!(
