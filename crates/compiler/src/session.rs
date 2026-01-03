@@ -6,14 +6,17 @@ use kernelforge_backend_cpu::runtime::{CpuExecutor, CpuExecutorOptions};
 use kernelforge_backend_gpu::{GpuExecutor, GpuPlanner};
 use kernelforge_ir::builder::KernelForgeModule;
 use kernelforge_ir::lowering::LoweringTarget;
-use kernelforge_kernels::config::{KernelProfile, MatmulProblem};
+use kernelforge_kernels::config::{KernelProfile, MatmulProblem, MatmulTilingConfig};
 use kernelforge_kernels::matmul::MatmulInputs;
+use kernelforge_optimizer::OptimizationPlan;
 use std::path::PathBuf;
+use tracing::info;
 
 pub struct CompilerSession {
     pipeline: CompilerPipeline,
     cpu_executor: CpuExecutor,
     gpu_executor: GpuExecutor,
+    plan: Option<OptimizationPlan>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,11 +58,27 @@ impl CompilerSession {
             pipeline,
             cpu_executor,
             gpu_executor,
+            plan: None,
         })
     }
 
     pub fn compile(&self, module: KernelForgeModule) -> Result<CompileArtifacts> {
-        self.pipeline.compile(module)
+        self.pipeline.compile(module, self.plan.as_ref())
+    }
+
+    /// Attach an optimization plan so lowering and runtime honor knobs.
+    pub fn set_plan(&mut self, plan: OptimizationPlan) {
+        info!(
+            target = plan.target,
+            tile_m = plan.knobs.tile_m,
+            tile_n = plan.knobs.tile_n,
+            tile_k = plan.knobs.tile_k,
+            vector_width = plan.knobs.vector_width,
+            fuse_matmul_activation = plan.knobs.enable_fuse_matmul_activation,
+            fuse_mlp = plan.knobs.enable_fuse_mlp,
+            "applying optimization plan to session"
+        );
+        self.plan = Some(plan);
     }
 
     pub fn execute_matmul(
@@ -67,16 +86,51 @@ impl CompilerSession {
         problem: MatmulProblem,
         inputs: &MatmulInputs<'_>,
     ) -> Result<MatmulResult> {
-        match self.pipeline.config().target {
+        let target = self
+            .plan
+            .as_ref()
+            .map(|p| match p.target.as_str() {
+                "gpu" => LoweringTarget::Gpu,
+                "cpu" => LoweringTarget::Cpu,
+                _ => self.pipeline.config().target,
+            })
+            .unwrap_or(self.pipeline.config().target);
+
+        match target {
             LoweringTarget::Cpu => {
-                let execution = self.cpu_executor.execute_matmul(problem, inputs)?;
+                let overrides = self.plan.as_ref().map(|p| MatmulTilingConfig {
+                    tile_m: p.knobs.tile_m,
+                    tile_n: p.knobs.tile_n,
+                    tile_k: p.knobs.tile_k,
+                    unroll: p.knobs.vector_width.max(1),
+                });
+
+                let execution = if let Some(config) = overrides {
+                    info!(
+                        "using plan-driven CPU matmul kernel ({}x{}x{}, vw={})",
+                        config.tile_m, config.tile_n, config.tile_k, config.unroll
+                    );
+                    self.cpu_executor
+                        .execute_matmul_with_overrides(problem, inputs, config, true)?
+                } else {
+                    self.cpu_executor.execute_matmul(problem, inputs)?
+                };
                 Ok(MatmulResult {
                     output: execution.output,
                     profile: Some(execution.profile),
                 })
             }
             LoweringTarget::Gpu => {
-                let output = self.gpu_executor.execute_matmul(problem, inputs)?;
+                let tiling = self.plan.as_ref().map(|p| {
+                    (
+                        p.knobs.tile_m as u32,
+                        p.knobs.tile_n as u32,
+                        p.knobs.tile_k as u32,
+                    )
+                });
+                let output = self
+                    .gpu_executor
+                    .execute_matmul(problem, inputs, tiling)?;
                 let profile = KernelProfile::new("gpu-wgpu", problem, 0.0);
                 Ok(MatmulResult {
                     output,

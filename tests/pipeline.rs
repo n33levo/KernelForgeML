@@ -31,7 +31,7 @@ fn pipeline_emits_valid_mlir() -> Result<()> {
 
     let config = CompilerConfig::default();
     let pipeline = CompilerPipeline::new(config);
-    let artifacts = pipeline.compile(module)?;
+    let artifacts = pipeline.compile(module, None)?;
     assert!(artifacts.mlir.contains("func.func"));
     assert!(artifacts.mlir.contains("linalg.matmul"));
     Ok(())
@@ -60,7 +60,7 @@ fn pipeline_lowering_assigns_schedules() -> Result<()> {
 
     let config = CompilerConfig::default();
     let pipeline = CompilerPipeline::new(config);
-    let artifacts = pipeline.compile(module)?;
+    let artifacts = pipeline.compile(module, None)?;
     
     // Check that lowering assigned schedules
     assert!(!artifacts.lowered.operations.is_empty());

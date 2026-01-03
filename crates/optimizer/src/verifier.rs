@@ -114,8 +114,13 @@ impl Verifier {
                     None,
                     ActivationKind::None,
                 );
+                let tiling = Some((
+                    plan.knobs.tile_m as u32,
+                    plan.knobs.tile_n as u32,
+                    plan.knobs.tile_k as u32,
+                ));
 
-                match gpu_exec.execute_matmul_timed(problem, &inputs) {
+                match gpu_exec.execute_matmul_timed(problem, &inputs, tiling) {
                     Ok(result) => (Some(result), Some(gpu_exec.device_info().clone())),
                     Err(e) => {
                         return Ok(AuditReport::rejected(
@@ -239,7 +244,7 @@ impl Verifier {
         // GPU execution
         let problem = MatmulProblem::new(m, n, k, DataType::F32);
         let inputs = MatmulInputs::new(lhs.view(), rhs.view(), None, ActivationKind::None);
-        let gpu_result = gpu_exec.execute_matmul_timed(problem, &inputs)?;
+        let gpu_result = gpu_exec.execute_matmul_timed(problem, &inputs, None)?;
 
         // Compare
         let mut max_err = 0.0f32;

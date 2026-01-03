@@ -9,6 +9,17 @@ use crate::dialect::{ActivationKind, Operation};
 use anyhow::Result;
 use tracing::debug;
 
+/// Minimal pass selection information derived from an optimization plan.
+#[derive(Debug, Clone)]
+pub struct PassPlan {
+    pub pass_order: Vec<String>,
+    pub enable_fuse_matmul_activation: bool,
+    pub enable_fuse_mlp: bool,
+    pub tile_m: usize,
+    pub tile_n: usize,
+    pub vector_width: usize,
+}
+
 /// A transformation pass that operates on the IR module.
 pub trait Pass: Send + Sync {
     /// Human-readable name of the pass.
@@ -313,6 +324,50 @@ pub struct PassPipeline {
 impl PassPipeline {
     pub fn new() -> Self {
         Self { passes: Vec::new() }
+    }
+
+    /// Build a pipeline that reflects a provided optimization plan.
+    /// Skips fusion/vectorization passes when knobs disable them.
+    pub fn from_plan(plan: &PassPlan) -> Self {
+        let mut passes: Vec<Box<dyn Pass>> = Vec::new();
+
+        for name in &plan.pass_order {
+            match name.as_str() {
+                "fold-constants" => passes.push(Box::new(FoldConstants)),
+                "fuse-matmul-activation" => {
+                    if plan.enable_fuse_matmul_activation {
+                        passes.push(Box::new(FuseMatmulActivation));
+                    } else {
+                        debug!(
+                            "skipping fuse-matmul-activation (disabled by plan knobs)"
+                        );
+                    }
+                }
+                "fuse-mlp-block" => {
+                    if plan.enable_fuse_mlp {
+                        passes.push(Box::new(FuseMLPBlock));
+                    } else {
+                        debug!("skipping fuse-mlp-block (disabled by plan knobs)");
+                    }
+                }
+                "tile-matmul" => {
+                    let tile_size = plan.tile_m.min(plan.tile_n);
+                    passes.push(Box::new(TileMatmul {
+                        tile_size,
+                        ..TileMatmul::default()
+                    }));
+                }
+                "vectorize-layernorm" => passes.push(Box::new(VectorizeLayerNorm {
+                    vector_width: plan.vector_width,
+                })),
+                "eliminate-dead-ops" => passes.push(Box::new(EliminateDeadOps)),
+                _ => {
+                    debug!(pass = name, "unknown pass in plan (already validated)");
+                }
+            }
+        }
+
+        Self { passes }
     }
 
     /// Creates a pipeline with the default optimization passes in order.

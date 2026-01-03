@@ -601,8 +601,8 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             
             // Step 2: Get hardware info
             println!("\nStep 2: Detecting hardware...");
-            let is_gpu = matches!(target, TargetArg::Gpu);
-            let gpu_executor = if is_gpu {
+            let requested_gpu = matches!(target, TargetArg::Gpu);
+            let gpu_executor = if requested_gpu {
                 match GpuExecutor::new(GpuPlanner::new()) {
                     Ok(exec) => {
                         let info = exec.device_info();
@@ -661,6 +661,14 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             if let Some(ref reason) = plan.reasoning {
                 println!("  Reasoning: {}", reason);
             }
+
+            let plan_requests_gpu = plan.target == "gpu";
+            if plan_requests_gpu != requested_gpu {
+                println!(
+                    "  Plan target is '{}', overriding CLI target {:?}", 
+                    plan.target, target
+                );
+            }
             
             // Step 4: Validate plan
             println!("\nStep 4: Validating plan...");
@@ -680,7 +688,9 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             println!("  Final output shape: {:?}", cpu_output.final_output.shape());
             
             // Step 6: GPU verification (if applicable)
-            let gpu_error = if let Some(ref exec) = gpu_executor {
+            let use_gpu = plan_requests_gpu && gpu_executor.is_some();
+            let gpu_error = if use_gpu {
+                let exec = gpu_executor.as_ref().unwrap();
                 use kernelforge_kernels::config::{ActivationKind, DataType, MatmulProblem};
                 use kernelforge_kernels::matmul::MatmulInputs;
                 
@@ -693,8 +703,13 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                     None,
                     ActivationKind::None,
                 );
+                let tiling = Some((
+                    plan.knobs.tile_m as u32,
+                    plan.knobs.tile_n as u32,
+                    plan.knobs.tile_k as u32,
+                ));
                 
-                match exec.execute_matmul_timed(problem, &inputs) {
+                match exec.execute_matmul_timed(problem, &inputs, tiling) {
                     Ok(result) => {
                         // Compare GPU Q with CPU Q
                         let max_error = (&cpu_output.q - &result.output)
@@ -716,7 +731,16 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                     }
                 }
             } else {
-                println!("\nStep 6: Skipping GPU verification (CPU target)");
+                let reason = if plan_requests_gpu {
+                    "GPU requested but not available"
+                } else {
+                    "plan target is CPU"
+                };
+                if plan_requests_gpu && gpu_executor.is_none() {
+                    println!("\nStep 6: Skipping GPU verification ({}).", reason);
+                } else {
+                    println!("\nStep 6: Skipping GPU verification ({})", reason);
+                }
                 None
             };
             

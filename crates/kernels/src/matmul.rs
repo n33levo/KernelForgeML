@@ -283,6 +283,82 @@ pub fn batched_reference_matmul(
     Ok(output)
 }
 
+/// Plan-driven blocked matmul that honors explicit tiling and vector-width hints.
+pub struct PlannedMatmul {
+    config: MatmulTilingConfig,
+}
+
+impl PlannedMatmul {
+    pub fn new(config: MatmulTilingConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl MatmulKernel for PlannedMatmul {
+    fn name(&self) -> &'static str {
+        "plan-tiled"
+    }
+
+    fn config(&self) -> MatmulTilingConfig {
+        self.config
+    }
+
+    fn supports(&self, _problem: &MatmulProblem) -> bool {
+        true
+    }
+
+    fn run(&self, problem: &MatmulProblem, inputs: &MatmulInputs<'_>) -> Result<Array2<f32>> {
+        ensure!(
+            problem.batch <= 1,
+            "plan-tiled kernel does not support batching yet"
+        );
+        validate_matmul_inputs(&inputs.lhs, &inputs.rhs)?;
+
+        let mut output = Array2::<f32>::zeros((problem.m, problem.n));
+        let tm = self.config.tile_m.max(1);
+        let tn = self.config.tile_n.max(1);
+        let tk = self.config.tile_k.max(1);
+        let vw = self.config.unroll.max(1);
+
+        let lhs = inputs.lhs;
+        let rhs = inputs.rhs;
+
+        let m = problem.m;
+        let n = problem.n;
+        let k = problem.k;
+
+        for i0 in (0..m).step_by(tm) {
+            let i_max = (i0 + tm).min(m);
+            for j0 in (0..n).step_by(tn) {
+                let j_max = (j0 + tn).min(n);
+                for p0 in (0..k).step_by(tk) {
+                    let p_max = (p0 + tk).min(k);
+                    let a_block = lhs.slice(s![i0..i_max, p0..p_max]);
+                    let b_block = rhs.slice(s![p0..p_max, j0..j_max]);
+                    let mut c_block = output.slice_mut(s![i0..i_max, j0..j_max]);
+
+                    for (row_idx, a_row) in a_block.outer_iter().enumerate() {
+                        for (col_idx, b_col) in b_block.axis_iter(ndarray::Axis(1)).enumerate() {
+                            let mut acc = 0.0f32;
+                            for chunk in (0..a_row.len()).step_by(vw) {
+                                let end = (chunk + vw).min(a_row.len());
+                                for idx in chunk..end {
+                                    acc += a_row[idx] * b_col[idx];
+                                }
+                            }
+                            let entry = c_block.get_mut((row_idx, col_idx)).unwrap();
+                            *entry += acc;
+                        }
+                    }
+                }
+            }
+        }
+
+        let output = apply_bias_activation(output, inputs.bias.as_ref(), inputs.activation)?;
+        Ok(output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

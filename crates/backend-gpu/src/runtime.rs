@@ -14,8 +14,7 @@ use std::num::NonZeroU64;
 use std::sync::mpsc;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
-
-const MATMUL_SHADER: &str = include_str!("shaders/matmul.wgsl");
+use tracing::info;
 
 /// Result of a GPU kernel execution with timing information.
 #[derive(Debug, Clone)]
@@ -67,8 +66,9 @@ impl GpuExecutor {
         &self,
         problem: MatmulProblem,
         inputs: &MatmulInputs<'_>,
+        tiling: Option<(u32, u32, u32)>,
     ) -> Result<Array2<f32>> {
-        let result = self.execute_matmul_timed(problem, inputs)?;
+        let result = self.execute_matmul_timed(problem, inputs, tiling)?;
         Ok(result.output)
     }
     
@@ -77,6 +77,7 @@ impl GpuExecutor {
         &self,
         problem: MatmulProblem,
         inputs: &MatmulInputs<'_>,
+        tiling: Option<(u32, u32, u32)>,
     ) -> Result<GpuExecutionResult> {
         if inputs.bias.is_some() {
             bail!("GPU matmul does not yet support bias");
@@ -85,7 +86,7 @@ impl GpuExecutor {
             bail!("GPU matmul does not yet support fused activation");
         }
 
-        let plan = self.planner.plan_matmul(problem)?;
+        let plan = self.planner.plan_matmul(problem, tiling)?;
         self.context.run_matmul_timed(plan, inputs)
     }
     
@@ -343,12 +344,21 @@ impl GpuContext {
                 push_constant_ranges: &[],
             });
 
-        let shader_module = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("matmul_shader"),
-                source: wgpu::ShaderSource::Wgsl(MATMUL_SHADER.into()),
-            });
+        let wg_m = plan.workgroup_m.max(1).min(16);
+        let wg_n = plan.workgroup_n.max(1).min(16);
+        let tile_k = plan.tile_k.max(1);
+        info!(
+            workgroup_m = wg_m,
+            workgroup_n = wg_n,
+            tile_k,
+            "gpu matmul plan applied"
+        );
+
+        let shader_src = matmul_shader_source(wg_m, wg_n, tile_k);
+        let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("matmul_shader"),
+            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
+        });
 
         let pipeline = self
             .device
@@ -359,8 +369,8 @@ impl GpuContext {
                 entry_point: "main",
             });
 
-        let workgroup_x = (problem.m as u32).div_ceil(16);
-        let workgroup_y = (problem.n as u32).div_ceil(16);
+        let workgroup_x = (problem.m as u32).div_ceil(wg_m);
+        let workgroup_y = (problem.n as u32).div_ceil(wg_n);
 
         let dispatch_start = Instant::now();
         
@@ -481,6 +491,75 @@ struct ShaderParams {
     n: u32,
     k: u32,
     _pad: u32,
+}
+
+fn matmul_shader_source(workgroup_m: u32, workgroup_n: u32, tile_k: u32) -> String {
+    format!(
+        r#"
+struct Params {{
+  size_m: u32,
+  size_n: u32,
+  size_k: u32,
+  _padding: u32,
+}}
+
+@group(0) @binding(0)
+var<storage, read> lhs: array<f32>;
+
+@group(0) @binding(1)
+var<storage, read> rhs: array<f32>;
+
+@group(0) @binding(2)
+var<storage, read_write> output: array<f32>;
+
+@group(0) @binding(3)
+var<uniform> params: Params;
+
+fn lhs_index(m: u32, k: u32) -> u32 {{
+  return m * params.size_k + k;
+}}
+
+fn rhs_index(k: u32, n: u32) -> u32 {{
+  return k * params.size_n + n;
+}}
+
+fn out_index(m: u32, n: u32) -> u32 {{
+  return m * params.size_n + n;
+}}
+
+@compute @workgroup_size({wg_m}, {wg_n}, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+  let m = gid.x;
+  let n = gid.y;
+  if (m >= params.size_m || n >= params.size_n) {{
+    return;
+  }}
+
+  var acc: f32 = 0.0;
+  var k_outer: u32 = 0u;
+  loop {{
+    if (k_outer >= params.size_k) {{
+        break;
+    }}
+    let k_limit = min(params.size_k, k_outer + {tile_k}u);
+    var k: u32 = k_outer;
+    loop {{
+        if (k >= k_limit) {{
+            break;
+        }}
+        acc = acc + lhs[lhs_index(m, k)] * rhs[rhs_index(k, n)];
+        k = k + 1u;
+    }}
+    k_outer = k_outer + {tile_k}u;
+  }}
+
+  output[out_index(m, n)] = acc;
+}}
+"#,
+        wg_m = workgroup_m,
+        wg_n = workgroup_n,
+        tile_k = tile_k
+    )
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 
 use crate::builder::KernelForgeModule;
 use crate::dialect::Operation;
-use crate::passes::PassPipeline;
+use crate::passes::{PassPipeline, PassPlan};
 use tracing::warn;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,8 +27,19 @@ pub struct LoweredModule {
 
 impl LoweredModule {
     pub fn lower(source: &KernelForgeModule, target: LoweringTarget) -> Self {
+        Self::lower_with_plan(source, target, None)
+    }
+
+    pub fn lower_with_plan(
+        source: &KernelForgeModule,
+        target: LoweringTarget,
+        plan: Option<&PassPlan>,
+    ) -> Self {
         let mut module = source.clone();
-        let pipeline = PassPipeline::with_default_passes();
+        let pipeline = match plan {
+            Some(plan) => PassPipeline::from_plan(plan),
+            None => PassPipeline::with_default_passes(),
+        };
         if let Err(err) = pipeline.run(&mut module) {
             warn!(error = %err, "failed to run lowering pass pipeline");
         }

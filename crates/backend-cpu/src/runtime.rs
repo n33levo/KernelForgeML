@@ -4,8 +4,9 @@ use crate::planner::{CpuMatmulPlan, CpuPlanner};
 use anyhow::Result;
 use kernelforge_autotune::cache::AutotuneCache;
 use kernelforge_autotune::tuner::Autotuner;
-use kernelforge_kernels::config::{KernelProfile, MatmulProblem};
-use kernelforge_kernels::matmul::MatmulInputs;
+use kernelforge_kernels::config::{KernelProfile, MatmulProblem, MatmulTilingConfig};
+use kernelforge_kernels::matmul::{MatmulInputs, PlannedMatmul};
+use kernelforge_kernels::MatmulKernel;
 use kernelforge_kernels::registry::KernelRegistry;
 use ndarray::Array2;
 use std::fs;
@@ -74,6 +75,25 @@ impl CpuExecutor {
         problem: MatmulProblem,
         inputs: &MatmulInputs<'_>,
     ) -> Result<MatmulExecution> {
+        self.execute_matmul_with_overrides(problem, inputs, MatmulTilingConfig::default(), false)
+    }
+
+    /// Execute matmul while honoring explicit tiling/vectorization knobs.
+    /// When `use_plan_kernel` is true, bypass autotuning and run the plan-driven kernel.
+    pub fn execute_matmul_with_overrides(
+        &mut self,
+        problem: MatmulProblem,
+        inputs: &MatmulInputs<'_>,
+        tiling: MatmulTilingConfig,
+        use_plan_kernel: bool,
+    ) -> Result<MatmulExecution> {
+        if use_plan_kernel {
+            let kernel = PlannedMatmul::new(tiling);
+            let output = kernel.run(&problem, inputs)?;
+            let profile = KernelProfile::new(kernel.name(), problem, 0.0);
+            return Ok(MatmulExecution { output, profile });
+        }
+
         let plan = self.planner.plan_matmul(problem, inputs)?;
         self.dispatch_matmul(plan, problem, inputs)
     }

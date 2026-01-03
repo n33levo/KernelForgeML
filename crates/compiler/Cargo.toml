@@ -17,7 +17,7 @@ kernelforge_kernels = { path = "../kernels" }
 kernelforge_autotune = { path = "../autotune" }
 kernelforge_backend_cpu = { path = "../backend-cpu" }
 kernelforge_backend_gpu = { path = "../backend-gpu" }
-kernelforge_optimizer = { path = "../optimizer", optional = true }
+kernelforge_optimizer = { path = "../optimizer" }
 
 [features]
-cli = ["clap", "tracing-subscriber", "kernelforge_optimizer"]
+cli = ["clap", "tracing-subscriber"]
