@@ -107,7 +107,7 @@ This is the "Assured" part: **no optimization is applied unless it passes verifi
 brew install llvm@18
 
 # Clone and setup
-git clone https://github.com/your-username/KernelForgeML
+git clone https://github.com/n33levo/KernelForgeML
 cd KernelForgeML
 source scripts/env.sh
 
