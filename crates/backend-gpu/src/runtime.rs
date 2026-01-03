@@ -71,6 +71,19 @@ impl GpuExecutor {
         let result = self.execute_matmul_timed(problem, inputs, tiling)?;
         Ok(result.output)
     }
+
+    /// Execute layer norm on GPU. Expects gamma/beta to be shape (1, features).
+    pub fn execute_layer_norm(
+        &self,
+        input: &Array2<f32>,
+        gamma: &Array2<f32>,
+        beta: &Array2<f32>,
+        epsilon: f32,
+        workgroup_y: u32,
+    ) -> Result<Array2<f32>> {
+        self.context
+            .run_layer_norm(input, gamma, beta, epsilon, workgroup_y)
+    }
     
     /// Execute matmul on GPU with detailed timing information.
     pub fn execute_matmul_timed(
@@ -482,6 +495,231 @@ impl GpuContext {
             total_time_ms,
         })
     }
+
+    fn run_layer_norm(
+        &self,
+        input: &Array2<f32>,
+        gamma: &Array2<f32>,
+        beta: &Array2<f32>,
+        epsilon: f32,
+        workgroup_y: u32,
+    ) -> Result<Array2<f32>> {
+        let rows = input.nrows() as u32;
+        let cols = input.ncols() as u32;
+
+        ensure!(
+            gamma.shape() == &[1, input.ncols()] && beta.shape() == &[1, input.ncols()],
+            "gamma/beta must be shape (1, features)"
+        );
+
+        let input_vec = input.as_standard_layout().to_owned().into_raw_vec();
+        let gamma_vec = gamma.as_standard_layout().to_owned().into_raw_vec();
+        let beta_vec = beta.as_standard_layout().to_owned().into_raw_vec();
+
+        let input_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ln_input"),
+                contents: cast_slice(&input_vec),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let gamma_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ln_gamma"),
+                contents: cast_slice(&gamma_vec),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let beta_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ln_beta"),
+                contents: cast_slice(&beta_vec),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+
+        let output_size =
+            (input_vec.len() * std::mem::size_of::<f32>()) as u64;
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ln_output"),
+            size: output_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ln_staging"),
+            size: output_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let params = LayerNormParams {
+            m: rows,
+            n: cols,
+            epsilon,
+            _pad: 0.0,
+        };
+        let params_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("ln_params"),
+                contents: cast_slice(&[params]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("ln_layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 4,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: NonZeroU64::new(
+                                    std::mem::size_of::<LayerNormParams>() as u64
+                                ),
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ln_bind_group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: gamma_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: beta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: output_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("layernorm_pipeline_layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let wg_y = workgroup_y.max(1).min(64);
+        let shader_src = layer_norm_shader_source(wg_y);
+        let shader_module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("layernorm_shader"),
+            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
+        });
+
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("layernorm_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader_module,
+                entry_point: "main",
+            });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("layernorm_encoder"),
+            });
+
+        let workgroups_x = rows;
+        let workgroups_y = (cols + wg_y - 1) / wg_y;
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("layernorm_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+        }
+
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size);
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let buffer_slice = staging_buffer.slice(..);
+        let (sender, receiver) = mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = sender.send(res);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        receiver
+            .recv()
+            .map_err(|_| anyhow!("failed to receive GPU map signal"))??;
+        let data = buffer_slice.get_mapped_range();
+        let result: Vec<f32> = cast_slice(&data).to_vec();
+        drop(data);
+        staging_buffer.unmap();
+
+        let output = Array2::from_shape_vec((rows as usize, cols as usize), result)
+            .map_err(|err| anyhow!("failed to shape GPU layernorm output: {err}"))?;
+
+        Ok(output)
+    }
 }
 
 #[repr(C)]
@@ -491,6 +729,15 @@ struct ShaderParams {
     n: u32,
     k: u32,
     _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LayerNormParams {
+    m: u32,
+    n: u32,
+    epsilon: f32,
+    _pad: f32,
 }
 
 fn matmul_shader_source(workgroup_m: u32, workgroup_n: u32, tile_k: u32) -> String {
@@ -559,6 +806,62 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
         wg_m = workgroup_m,
         wg_n = workgroup_n,
         tile_k = tile_k
+    )
+}
+
+fn layer_norm_shader_source(workgroup_y: u32) -> String {
+    format!(
+        r#"
+struct Params {{
+  size_m: u32,
+  size_n: u32,
+  epsilon: f32,
+  _pad: f32,
+}}
+
+@group(0) @binding(0)
+var<storage, read> input: array<f32>;
+@group(0) @binding(1)
+var<storage, read> gamma: array<f32>;
+@group(0) @binding(2)
+var<storage, read> beta: array<f32>;
+@group(0) @binding(3)
+var<storage, read_write> output: array<f32>;
+@group(0) @binding(4)
+var<uniform> params: Params;
+
+fn idx(m: u32, n: u32) -> u32 {{
+  return m * params.size_n + n;
+}}
+
+@compute @workgroup_size(1, {wg_y}, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+  let row = gid.x;
+  let col = gid.y;
+  if (row >= params.size_m || col >= params.size_n) {{
+    return;
+  }}
+
+  var mean: f32 = 0.0;
+  for (var i: u32 = 0u; i < params.size_n; i = i + 1u) {{
+    mean = mean + input[idx(row, i)];
+  }}
+  mean = mean / f32(params.size_n);
+
+  var var_acc: f32 = 0.0;
+  for (var i: u32 = 0u; i < params.size_n; i = i + 1u) {{
+    let d = input[idx(row, i)] - mean;
+    var_acc = var_acc + d * d;
+  }}
+  let inv_std = inverseSqrt(var_acc / f32(params.size_n) + params.epsilon);
+
+  let x = input[idx(row, col)];
+  let g = gamma[col];
+  let b = beta[col];
+  output[idx(row, col)] = (x - mean) * inv_std * g + b;
+}}
+"#,
+        wg_y = workgroup_y
     )
 }
 

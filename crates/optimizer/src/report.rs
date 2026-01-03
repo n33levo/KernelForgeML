@@ -20,6 +20,57 @@ pub enum VerificationResult {
     },
 }
 
+/// Structured rejection reason for failed verifications.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum RejectReason {
+    /// Plan validation failed (invalid knobs, unknown passes, etc.)
+    Validation {
+        detail: String,
+    },
+    /// GPU execution failed at a specific stage
+    GpuExecutionFailed {
+        stage: String,
+        shape: String,
+        detail: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        plan_knobs: Option<String>,
+    },
+    /// Numeric mismatch between CPU reference and GPU output
+    NumericMismatch {
+        max_abs_error: f32,
+        tolerance: f32,
+        detail: String,
+    },
+    /// GPU not available
+    GpuUnavailable {
+        detail: String,
+    },
+}
+
+impl RejectReason {
+    pub fn to_string(&self) -> String {
+        match self {
+            RejectReason::Validation { detail } => {
+                format!("Validation failed: {}", detail)
+            }
+            RejectReason::GpuExecutionFailed { stage, shape, detail, plan_knobs } => {
+                let mut msg = format!("GPU execution failed at stage '{}' (shape {}): {}", stage, shape, detail);
+                if let Some(knobs) = plan_knobs {
+                    msg.push_str(&format!("\nPlan knobs: {}", knobs));
+                }
+                msg
+            }
+            RejectReason::NumericMismatch { max_abs_error, tolerance, detail } => {
+                format!("Numeric mismatch: max_error={:.2e} > tolerance={:.2e}\n{}", max_abs_error, tolerance, detail)
+            }
+            RejectReason::GpuUnavailable { detail } => {
+                format!("GPU unavailable: {}", detail)
+            }
+        }
+    }
+}
+
 /// Complete audit report for a verification run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditReport {
@@ -49,20 +100,20 @@ pub struct AuditReport {
     /// Whether the plan was accepted.
     pub accepted: bool,
 
-    /// Reason for rejection if not accepted.
+    /// Structured reason for rejection if not accepted.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rejection_reason: Option<String>,
+    pub rejection_reason: Option<RejectReason>,
 }
 
 impl AuditReport {
-    /// Create a rejection report.
-    pub fn rejected(plan: OptimizationPlan, sig: WorkloadSignature, reason: String) -> Self {
+    /// Create a rejection report with structured reason.
+    pub fn rejected_with_reason(plan: OptimizationPlan, sig: WorkloadSignature, reason: RejectReason) -> Self {
         Self {
             plan,
             workload_signature: sig,
             hardware_info: None,
             verification_result: VerificationResult::Failed {
-                reason: reason.clone(),
+                reason: reason.to_string(),
             },
             cpu_reference_time_ms: 0.0,
             gpu_kernel_time_ms: None,
@@ -70,6 +121,11 @@ impl AuditReport {
             accepted: false,
             rejection_reason: Some(reason),
         }
+    }
+
+    /// Create a rejection report (legacy string-based).
+    pub fn rejected(plan: OptimizationPlan, sig: WorkloadSignature, reason: String) -> Self {
+        Self::rejected_with_reason(plan, sig, RejectReason::Validation { detail: reason })
     }
 
     /// Save report to JSON file.

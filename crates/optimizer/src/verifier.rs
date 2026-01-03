@@ -1,7 +1,7 @@
 //! Verification harness - ensures optimization plans are correct.
 
 use crate::plan::OptimizationPlan;
-use crate::report::{AuditReport, VerificationResult};
+use crate::report::{AuditReport, RejectReason, VerificationResult};
 use crate::workload::Microblock;
 use anyhow::Result;
 use kernelforge_backend_gpu::runtime::{GpuDeviceInfo, GpuExecutor};
@@ -91,10 +91,12 @@ impl Verifier {
 
         // Step 1: Validate plan
         if let Err(e) = plan.validate() {
-            return Ok(AuditReport::rejected(
+            return Ok(AuditReport::rejected_with_reason(
                 plan.clone(),
                 microblock.signature.clone(),
-                format!("Plan validation failed: {}", e),
+                RejectReason::Validation {
+                    detail: format!("Plan validation failed: {}", e),
+                },
             ));
         }
 
@@ -123,18 +125,34 @@ impl Verifier {
                 match gpu_exec.execute_matmul_timed(problem, &inputs, tiling) {
                     Ok(result) => (Some(result), Some(gpu_exec.device_info().clone())),
                     Err(e) => {
-                        return Ok(AuditReport::rejected(
+                        let plan_knobs = format!(
+                            "tile_m={}, tile_n={}, tile_k={}, vector_width={}, workgroup_m={}, workgroup_n={}",
+                            plan.knobs.tile_m,
+                            plan.knobs.tile_n,
+                            plan.knobs.tile_k,
+                            plan.knobs.vector_width,
+                            plan.knobs.tile_m.min(16),
+                            plan.knobs.tile_n.min(16)
+                        );
+                        return Ok(AuditReport::rejected_with_reason(
                             plan.clone(),
                             microblock.signature.clone(),
-                            format!("GPU execution failed: {}", e),
+                            RejectReason::GpuExecutionFailed {
+                                stage: "matmul".into(),
+                                shape: format!("{}x{}x{}", m, n, k),
+                                detail: format!("{}", e),
+                                plan_knobs: Some(plan_knobs),
+                            },
                         ));
                     }
                 }
             } else {
-                return Ok(AuditReport::rejected(
+                return Ok(AuditReport::rejected_with_reason(
                     plan.clone(),
                     microblock.signature.clone(),
-                    "GPU target requested but GPU not available".into(),
+                    RejectReason::GpuUnavailable {
+                        detail: "GPU target requested but GPU not available".into(),
+                    },
                 ));
             }
         } else {

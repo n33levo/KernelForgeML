@@ -10,6 +10,7 @@ use kernelforge_ir::dialect::{ActivationKind as IrActivation, DataType as IrData
 use kernelforge_ir::lowering::LoweringTarget;
 use kernelforge_kernels::config::{ActivationKind, DataType, MatmulProblem};
 use kernelforge_kernels::matmul::MatmulInputs;
+use kernelforge_kernels::utils::softmax_inplace;
 use ndarray::Array2;
 use std::fs;
 use std::path::PathBuf;
@@ -472,7 +473,11 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 }
             } else {
                 println!("✗ Plan REJECTED");
-                println!("  Reason: {:?}", report.rejection_reason);
+                if let Some(reason) = &report.rejection_reason {
+                    println!("\n{}", reason.to_string());
+                } else {
+                    println!("  Reason: Unknown");
+                }
             }
         }
         
@@ -743,6 +748,31 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 }
                 None
             };
+
+            // Step 6b: End-to-end GPU transformer (softmax on CPU)
+            if let Some(ref exec) = gpu_executor {
+                println!("\nStep 6b: Running full transformer on GPU (softmax on CPU)...");
+                match run_gpu_transformer_block(exec, &workload, &plan) {
+                    Ok(gpu_out) => {
+                        let tol = 2e-1;
+                        let max_error = (&cpu_output.final_output - &gpu_out)
+                            .mapv(|x| x.abs())
+                            .fold(0.0f32, |a, &b| a.max(b));
+                        println!("  End-to-end GPU max error vs CPU: {:.2e}", max_error);
+                        if max_error > tol {
+                            println!("  ✗ GPU end-to-end mismatch exceeds tolerance ({:.2e})", tol);
+                            return Err(anyhow::anyhow!(
+                                "GPU end-to-end verification failed (max_error {:.2e} > {:.2e})",
+                                max_error,
+                                tol
+                            ));
+                        } else {
+                            println!("  ✓ GPU end-to-end output matches CPU reference (<= {:.2e})", tol);
+                        }
+                    }
+                    Err(e) => println!("  ⚠ GPU transformer execution failed: {}", e),
+                }
+            }
             
             // Step 7: Emit results
             println!("\n=== Compilation Complete ===\n");
@@ -865,4 +895,98 @@ fn sample_fusable_module() -> KernelForgeModule {
             tensor_f32("normed", &[128, 768]),
         )
         .build()
+}
+
+fn run_gpu_transformer_block(
+    exec: &kernelforge_backend_gpu::runtime::GpuExecutor,
+    workload: &kernelforge_optimizer::TransformerMicroblock,
+    plan: &kernelforge_optimizer::OptimizationPlan,
+) -> anyhow::Result<ndarray::Array2<f32>> {
+    use kernelforge_kernels::config::{ActivationKind, DataType, MatmulProblem};
+    use kernelforge_kernels::matmul::MatmulInputs;
+
+    let seq = workload.signature.seq_len;
+    let d = workload.signature.d_model;
+    let tiling = Some((
+        plan.knobs.tile_m as u32,
+        plan.knobs.tile_n as u32,
+        plan.knobs.tile_k as u32,
+    ));
+
+    // Q = X * Wq
+    let q = exec
+        .execute_matmul_timed(
+            MatmulProblem::new(seq, d, d, DataType::F32),
+            &MatmulInputs::new(
+                workload.input.view(),
+                workload.w_q.view(),
+                None,
+                ActivationKind::None,
+            ),
+            tiling,
+        )?
+        .output;
+
+    // K = X * Wk
+    let k = exec
+        .execute_matmul_timed(
+            MatmulProblem::new(seq, d, d, DataType::F32),
+            &MatmulInputs::new(
+                workload.input.view(),
+                workload.w_k.view(),
+                None,
+                ActivationKind::None,
+            ),
+            tiling,
+        )?
+        .output;
+
+    // V = X * Wv
+    let v = exec
+        .execute_matmul_timed(
+            MatmulProblem::new(seq, d, d, DataType::F32),
+            &MatmulInputs::new(
+                workload.input.view(),
+                workload.w_v.view(),
+                None,
+                ActivationKind::None,
+            ),
+            tiling,
+        )?
+        .output;
+
+    // Scores = Q * K^T
+    let k_t = k.t().to_owned();
+    let mut scores = exec
+        .execute_matmul_timed(
+            MatmulProblem::new(seq, seq, d, DataType::F32),
+            &MatmulInputs::new(q.view(), k_t.view(), None, ActivationKind::None),
+            tiling,
+        )?
+        .output;
+
+    // Softmax on CPU (hybrid path)
+    let scale = 1.0 / (d as f32).sqrt();
+    scores.mapv_inplace(|x| x * scale);
+    softmax_inplace(scores.view_mut());
+
+    // Context = softmax(scores) * V
+    let context = exec
+        .execute_matmul_timed(
+            MatmulProblem::new(seq, d, seq, DataType::F32),
+            &MatmulInputs::new(scores.view(), v.view(), None, ActivationKind::None),
+            tiling,
+        )?
+        .output;
+
+    // LayerNorm on GPU
+    let ln = exec.execute_layer_norm(
+        &context,
+        &workload.ln_gamma,
+        &workload.ln_beta,
+        plan.knobs.layernorm_epsilon,
+        plan.knobs.vector_width as u32,
+    )?;
+
+    Ok(ln)
 }
